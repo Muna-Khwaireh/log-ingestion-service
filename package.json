@@ -4,15 +4,21 @@
   "description": "A high-performance log ingestion and query service",
   "main": "dist/index.js",
   "scripts": {
-    "build": "tsc",
-    "start": "node dist/index.js"
-  },
+  "build": "tsc",
+  "migrate": "drizzle-kit migrate",
+  "start": "npm run migrate && node dist/index.js"
+},
   "keywords": [],
   "author": "",
   "license": "ISC",
   "type": "module",
   "devDependencies": {
     "@types/node": "^26.2.0",
+    "drizzle-kit": "^0.31.10",
     "typescript": "^7.0.2"
+  },
+  "dependencies": {
+    "drizzle-orm": "^0.45.2",
+    "postgres": "^3.4.9"
   }
 }
