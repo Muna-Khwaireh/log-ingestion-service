@@ -1,13 +1,18 @@
 {
   "name": "log-ingestion-service",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "A high-performance log ingestion and query service",
+  "main": "dist/index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "build": "tsc",
+    "start": "node dist/index.js"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "type": "commonjs"
+  "type": "module",
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "typescript": "^7.0.2"
+  }
 }
