@@ -1,3 +1,4 @@
+import type { LogQuery } from "../logs/log.types.js";
 import {  getLogs,insertLogs } from "../repositories/logs.repository.js";
 import {
   validateLog,
@@ -44,6 +45,6 @@ export async function ingestLogs(
   };
 }
 
-export async function queryLogs() {
-  return getLogs();
+export async function queryLogs(query: LogQuery) {
+  return getLogs(query);
 }

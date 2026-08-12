@@ -27,3 +27,10 @@ export interface RejectedLog {
   index: number;
   reason: string;
 }
+
+export interface LogQuery {
+  service?: string | undefined;
+  level?: LogLevel | undefined;
+  limit?: number | undefined;
+  offset?: number | undefined;
+}

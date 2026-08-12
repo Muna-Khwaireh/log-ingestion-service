@@ -1,12 +1,26 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { ingestLogs, queryLogs } from "../services/logs.service.js";
+import type { LogQuery } from "../logs/log.types.js";
 
 export async function handleGetLogs(
-  _req: IncomingMessage,
+  req: IncomingMessage,
   res: ServerResponse,
 ) {
   try {
-    const logs = await queryLogs();
+    const url = new URL(req.url ?? "/logs", "http://localhost");
+
+    const query: LogQuery = {
+      service: url.searchParams.get("service") ?? undefined,
+      level: url.searchParams.get("level") as LogQuery["level"] ?? undefined,
+      limit: url.searchParams.has("limit")
+        ? Number(url.searchParams.get("limit"))
+        : undefined,
+      offset: url.searchParams.has("offset")
+        ? Number(url.searchParams.get("offset"))
+        : undefined,
+    };
+
+    const logs = await queryLogs(query);
 
     res.writeHead(200, {
       "Content-Type": "application/json",

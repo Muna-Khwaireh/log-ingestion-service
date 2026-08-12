@@ -5,12 +5,14 @@ export async function handleLogsRoutes(
   req: IncomingMessage,
   res: ServerResponse,
 ) {
-  if (req.method === "GET" && req.url === "/logs") {
+  const url = new URL(req.url ?? "/", "http://localhost");
+
+  if (req.method === "GET" && url.pathname === "/logs") {
     await handleGetLogs(req, res);
     return true;
   }
 
-  if (req.method === "POST" && req.url === "/logs") {
+  if (req.method === "POST" && url.pathname === "/logs") {
     await handlePostLogs(req, res);
     return true;
   }
