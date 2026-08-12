@@ -1,5 +1,5 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { queryLogs } from "../services/logs.service.js";
+import { ingestLogs, queryLogs } from "../services/logs.service.js";
 
 export async function handleGetLogs(
   _req: IncomingMessage,
@@ -23,6 +23,60 @@ export async function handleGetLogs(
     res.end(
       JSON.stringify({
         error: "internal server error",
+      }),
+    );
+  }
+}
+async function readBody(req: IncomingMessage): Promise<unknown> {
+  const chunks: Buffer[] = [];
+
+  for await (const chunk of req) {
+    chunks.push(Buffer.from(chunk));
+  }
+
+  const body = Buffer.concat(chunks).toString("utf-8");
+
+  return JSON.parse(body);
+}
+
+export async function handlePostLogs(
+  req: IncomingMessage,
+  res: ServerResponse,
+) {
+  try {
+    const body = await readBody(req);
+
+    if (!Array.isArray(body)) {
+      res.writeHead(400, {
+        "Content-Type": "application/json",
+      });
+
+      res.end(
+        JSON.stringify({
+          error: "request body must be an array",
+        }),
+      );
+
+      return;
+    }
+
+    const result = await ingestLogs(body);
+
+    res.writeHead(201, {
+      "Content-Type": "application/json",
+    });
+
+    res.end(JSON.stringify(result));
+  } catch (error) {
+    console.error("Failed to ingest logs:", error);
+
+    res.writeHead(400, {
+      "Content-Type": "application/json",
+    });
+
+    res.end(
+      JSON.stringify({
+        error: "invalid JSON body",
       }),
     );
   }
