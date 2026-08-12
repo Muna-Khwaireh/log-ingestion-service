@@ -1,15 +1,17 @@
 import { createServer } from "node:http";
+import { handleRoutes } from "./routes/index.js";
 
 const PORT = 8080;
 
-const server = createServer((req, res) => {
-  if (req.method === "GET" && req.url === "/health") {
-    res.writeHead(200, { "Content-Type": "text/plain" });
-    res.end("OK");
+const server = createServer(async (req, res) => {
+  if (await handleRoutes(req, res)) {
     return;
   }
 
-  res.writeHead(404, { "Content-Type": "text/plain" });
+  res.writeHead(404, {
+    "Content-Type": "text/plain",
+  });
+
   res.end("Not Found");
 });
 
