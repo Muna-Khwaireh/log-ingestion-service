@@ -121,7 +121,7 @@ export async function aggregateLogs(query: AggregateQuery) {
       .select({
         start: bucketStart,
         group: logs.service,
-        count: sql<number>`count(*)`,
+        count: sql<number>`count(*)::int`,
       })
       .from(logs)
       .where(and(...conditions))
@@ -134,7 +134,7 @@ export async function aggregateLogs(query: AggregateQuery) {
       .select({
         start: bucketStart,
         group: logs.level,
-        count: sql<number>`count(*)`,
+        count: sql<number>`count(*)::int`,
       })
       .from(logs)
       .where(and(...conditions))
@@ -146,7 +146,7 @@ export async function aggregateLogs(query: AggregateQuery) {
     .select({
       start: bucketStart,
       group: sql<string | null>`NULL`,
-      count: sql<number>`count(*)`,
+      count: sql<number>`count(*)::int`,
     })
     .from(logs)
     .where(and(...conditions))

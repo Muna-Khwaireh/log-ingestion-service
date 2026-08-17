@@ -5,6 +5,9 @@ services:
       - "8080:8080"
     environment:
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/logs
+      RETENTION_DAYS: 30
+      RETENTION_INTERVAL_MS: 3600000
+      RETENTION_BATCH_SIZE: 10000
     depends_on:
       postgres:
         condition: service_healthy

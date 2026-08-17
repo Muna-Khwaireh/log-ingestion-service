@@ -1,6 +1,7 @@
-const VALID_LEVELS = ["debug", "info", "warn", "error"] as const;
-
-type LogLevel = (typeof VALID_LEVELS)[number];
+import {
+  LOG_LEVELS,
+  type LogLevel,
+} from "../logs/log.types.js";
 
 export type ValidatedLog = {
   timestamp: Date;
@@ -64,7 +65,7 @@ export function validateLog(input: unknown): ValidationResult {
     };
   }
 
-  if (!VALID_LEVELS.includes(log.level as LogLevel)) {
+  if (!LOG_LEVELS.includes(log.level as LogLevel)) {
     return {
       valid: false,
       reason: `invalid level: '${log.level}'`,
