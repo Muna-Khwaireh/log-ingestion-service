@@ -10,12 +10,14 @@ export async function deleteExpiredLogs(
     Date.now() - retentionDays * 24 * 60 * 60 * 1000,
   );
 
+  const cutoffIso = cutoff.toISOString();
+
   const result = await db.execute(sql`
     DELETE FROM ${logs}
     WHERE id IN (
       SELECT id
       FROM ${logs}
-      WHERE timestamp < ${cutoff}
+      WHERE timestamp < ${cutoffIso}::timestamptz
       ORDER BY timestamp ASC
       LIMIT ${batchSize}
     )
