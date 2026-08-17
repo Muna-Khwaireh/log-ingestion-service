@@ -1,9 +1,10 @@
 import type { LogQuery } from "../logs/log.types.js";
-import {  getLogs,insertLogs } from "../repositories/logs.repository.js";
+import { getLogs, insertLogs } from "../repositories/logs.repository.js";
 import {
   validateLog,
   type ValidatedLog,
 } from "../validation/logs.validation.js";
+import { encodeCursor } from "../logs/log.cursor.js";
 
 export type IngestResult = {
   accepted: number;
@@ -46,5 +47,20 @@ export async function ingestLogs(
 }
 
 export async function queryLogs(query: LogQuery) {
-  return getLogs(query);
+  const rows = await getLogs(query);
+
+  const hasMore = rows.length > query.limit;
+  const logs = hasMore ? rows.slice(0, query.limit) : rows;
+
+  const lastLog = logs.at(-1);
+
+const nextCursor =
+  hasMore && lastLog
+    ? encodeCursor(lastLog.timestamp, lastLog.id)
+    : null;
+
+  return {
+    logs,
+    next_cursor: nextCursor,
+  };
 }

@@ -29,8 +29,30 @@ export interface RejectedLog {
 }
 
 export interface LogQuery {
-  service?: string | undefined;
-  level?: LogLevel | undefined;
-  limit?: number | undefined;
-  offset?: number | undefined;
+  service?: string;
+  level?: LogLevel;
+  since?: Date;
+  until?: Date;
+  attributeFilters?: Record<string, string>;
+  messageQuery?: string;
+  limit: number;
+  cursor?: {
+    timestamp: Date;
+    id: number;
+  };
+}
+
+export type AggregateBucket = "1m" | "5m" | "1h" | "1d";
+
+export type AggregateGroupBy = "service" | "level";
+
+export interface AggregateQuery {
+  since: Date;
+  until: Date;
+  bucket: AggregateBucket;
+  groupBy?: AggregateGroupBy;
+  service?: string;
+  level?: LogLevel;
+  attributeFilters?: Record<string, string>;
+  messageQuery?: string;
 }

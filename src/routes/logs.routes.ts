@@ -1,6 +1,9 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { handlePostLogs,handleGetLogs } from "../handlers/logs.handler.js";
-
+import {
+  handlePostLogs,
+  handleGetLogs,
+  handleAggregateLogs,
+} from "../handlers/logs.handler.js";
 export async function handleLogsRoutes(
   req: IncomingMessage,
   res: ServerResponse,
@@ -16,6 +19,10 @@ export async function handleLogsRoutes(
     await handlePostLogs(req, res);
     return true;
   }
+  if (req.method === "GET" && url.pathname === "/logs/aggregate") {
+  await handleAggregateLogs(req, res);
+  return true;
+} 
 
   return false;
 }
