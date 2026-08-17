@@ -44,12 +44,12 @@ if (query.until) {
   }
 
   if (query.attributeFilters) {
-    for (const [key, value] of Object.entries(query.attributeFilters)) {
-      conditions.push(
-        sql`${logs.attributes}->>${key} = ${value}`,
-      );
-    }
+  for (const [key, value] of Object.entries(query.attributeFilters)) {
+    conditions.push(
+      sql`${logs.attributes} @> ${JSON.stringify({ [key]: value })}::jsonb`,
+    );
   }
+}
 
   if (query.cursor) {
     conditions.push(
@@ -92,12 +92,12 @@ export async function aggregateLogs(query: AggregateQuery) {
   }
 
   if (query.attributeFilters) {
-    for (const [key, value] of Object.entries(query.attributeFilters)) {
-      conditions.push(
-        sql`${logs.attributes}->>${key} = ${value}`,
-      );
-    }
+  for (const [key, value] of Object.entries(query.attributeFilters)) {
+    conditions.push(
+      sql`${logs.attributes} @> ${JSON.stringify({ [key]: value })}::jsonb`,
+    );
   }
+}
 
   const bucket = {
     "1m": "1 minute",
