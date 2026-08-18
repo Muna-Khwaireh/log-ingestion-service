@@ -286,6 +286,10 @@ Stored as PostgreSQL `timestamptz`.
 
 The timestamp is indexed because time-range filtering is a primary query pattern.
 
+It is also the partition key: `logs` is range partitioned by `timestamp`, one
+partition per `RETENTION_PARTITION_HOURS`, which is what makes expiry a
+`DROP TABLE` rather than a `DELETE`. See [Retention](#retention).
+
 ### Level
 
 Stored as text and validated at the application layer.
@@ -329,10 +333,10 @@ This provides a flexible schema for arbitrary log attributes while keeping the d
 
 The following indexes are used:
 
-### Timestamp + ID
+### Timestamp + ID (primary key)
 
 ```text
-idx_logs_timestamp_id
+logs_pkey
 ```
 
 Supports:
@@ -341,6 +345,17 @@ Supports:
 * descending log queries
 * cursor pagination
 * deterministic ordering
+
+`logs` is partitioned by `timestamp`, and a partitioned table's unique
+constraints must contain the partition key, so the primary key is
+`(timestamp, id)`. PostgreSQL reads that index backwards to satisfy
+`ORDER BY timestamp DESC, id DESC`, so it replaces the former
+`idx_logs_timestamp_id` outright rather than being maintained alongside it, and
+the number of indexes written on each insert is unchanged:
+
+```text
+Index Scan Backward using logs_p20260818t00_pkey
+```
 
 ### Service + Timestamp + ID
 
@@ -426,18 +441,88 @@ Final benchmark results will be added after the official load-generator test.
 
 ## Retention
 
-The service implements automatic retention of expired logs.
+Expired logs are removed by dropping whole partitions, not by deleting rows.
 
-The retention service:
+`logs` is declared `PARTITION BY RANGE ("timestamp")`, with one partition per
+`RETENTION_PARTITION_HOURS` (default 24). A retention pass:
 
-1. Calculates a cutoff timestamp based on the retention period.
-2. Selects expired logs ordered by timestamp.
-3. Deletes expired logs in batches.
-4. Reports the number of deleted records.
+1. Creates any partition missing from the retention window, plus
+   `RETENTION_PARTITIONS_AHEAD` partitions beyond now, so ingestion always has
+   somewhere to write.
+2. Drops every partition whose exclusive upper bound is at or below the cutoff.
+   Such a partition cannot contain a single unexpired row, so no row-level work
+   is required to prove it is safe to remove.
+3. Sweeps rows older than the cutoff out of the default partition, looping until
+   it is clear.
 
-Batch deletion prevents a single large delete operation from unnecessarily affecting the database.
+The cost of a pass depends on the number of expired *partitions*, not on the
+number of expired *rows*, which is what allows retention to keep pace with any
+ingestion rate. A pass that has nothing to do costs about 7 ms and issues no DDL
+at all, because existing partitions are listed before anything is created.
 
-The retention functionality was tested with a log older than the configured retention period and successfully deleted the expired record.
+### Configuration
+
+| variable | default | meaning |
+| --- | --- | --- |
+| `RETENTION_DAYS` | `30` | how long a log is kept |
+| `RETENTION_INTERVAL_MS` | `3600000` | how often a retention pass runs |
+| `RETENTION_PARTITION_HOURS` | `24` | partition width, and so the precision of expiry |
+| `RETENTION_PARTITIONS_AHEAD` | `2` | partitions kept ready ahead of now |
+| `RETENTION_LOCK_TIMEOUT_MS` | `3000` | how long a partition change may wait for its lock |
+| `RETENTION_BATCH_SIZE` | `10000` | batch size for the default-partition sweep |
+
+A pass also runs once at startup, before the server accepts requests, so the
+window is covered from the first batch.
+
+### Why not DELETE
+
+The same 200,000 rows, with the same three indexes, removed both ways:
+
+| | `DELETE` | `DROP TABLE` partition |
+| --- | --- | --- |
+| time | 112 ms | 10.7 ms |
+| dead tuples produced | 200,000 | 0 |
+| `VACUUM` afterwards | required, 72 ms | none |
+| space released | 57 MB to 18 MB, still allocated to the table | 57 MB to 0 bytes |
+
+`DELETE` also scales with the row count while `DROP TABLE` does not: dropping
+30 partitions holding 200,004 rows took 279 ms in total and left zero dead
+tuples behind.
+
+The deeper problem is that a delete-based policy must sustain the ingestion rate
+forever. At 15,000 logs/second, steady state requires deleting 15,000 rows per
+second indefinitely, every one of them producing a dead tuple that autovacuum
+must later reclaim from the same pages and the same CPU that ingestion is using.
+Dropping a partition competes with nothing.
+
+### Locking
+
+Creating or dropping a partition takes a brief `ACCESS EXCLUSIVE` lock on the
+parent table. It is only a catalog change, but it still has to wait for
+in-flight statements, so every maintenance statement runs inside a transaction
+with a `lock_timeout` of `RETENTION_LOCK_TIMEOUT_MS`. If the lock is not
+available quickly the statement is abandoned and retried on the next pass,
+rather than queueing in front of live ingestion.
+
+### Retention precision
+
+Because expiry drops whole partitions, a log can outlive its cutoff by up to one
+partition width before the partition containing it becomes fully expired.
+Reducing `RETENTION_PARTITION_HOURS` tightens that bound, at the cost of one more
+partition for the planner to consider per day retained.
+
+### The default partition
+
+Timestamps are validated to at most five minutes in the future, but have no
+lower bound, so a client may legitimately send a log far outside the retention
+window. A `DEFAULT` partition catches those rows. Without it a single such row
+would abort the entire `COPY` batch and fail the whole request with 503.
+
+In normal operation the default partition stays empty: partitions already exist
+for the whole retention window, so the only rows that can miss a range are
+already older than the cutoff, and step 3 removes them. Rows kept there remain
+queryable in the meantime, which is why a failure to create a partition degrades
+throughput rather than correctness.
 
 ## Reliability and Validation
 
@@ -585,8 +670,9 @@ Key optimizations currently implemented:
 * composite indexes for service and level filtering
 * deterministic cursor pagination
 * JSONB GIN indexing
+* partition pruning on time-range queries
 * PostgreSQL `date_bin` aggregation
-* batched retention deletion
+* retention by dropping expired partitions
 * database-side filtering and aggregation
 
 ## Known Limitations
@@ -597,7 +683,14 @@ Key optimizations currently implemented:
   rare-term search measured approximately 89 ms without it against 9 ms with
   it; common-term searches are unaffected either way.
 * JSONB attributes provide flexibility but are less restrictive than a normalized attribute table.
-* Retention uses batched deletion rather than partition-based expiration.
+* Retention drops whole partitions, so a log can outlive its cutoff by up to one
+  partition width (24 hours by default). `RETENTION_PARTITION_HOURS` trades that
+  precision against the number of partitions the planner considers.
+* Partitioning adds planning work to queries that cannot be pruned to a single
+  partition. With 33 partitions an unfiltered page costs about 0.6 ms against
+  0.3 ms unpartitioned once the plan is cached, and about 15 ms on the first
+  execution of a statement before caching. Queries carrying `since` prune to the
+  partitions they need and are faster than they were before partitioning.
 * Final performance characteristics depend on the official benchmark environment and workload.
 
 ## Optional Features
@@ -630,6 +723,7 @@ src/
 ├── repositories/
 │   └── logs.repository.ts
 ├── retention/
+│   ├── partitions.ts
 │   └── retention.service.ts
 ├── routes/
 │   ├── health.routes.ts

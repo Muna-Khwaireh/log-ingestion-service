@@ -3,6 +3,7 @@ import {
   index,
   jsonb,
   pgTable,
+  primaryKey,
   text,
   timestamp,
 } from "drizzle-orm/pg-core";
@@ -11,7 +12,6 @@ export const logs = pgTable(
   "logs",
   {
     id: bigint("id", { mode: "number" })
-      .primaryKey()
       .generatedAlwaysAsIdentity(),
 
     timestamp: timestamp("timestamp", {
@@ -31,10 +31,11 @@ export const logs = pgTable(
       .default({}),
   },
   (table) => [
-    index("idx_logs_timestamp_id").on(
-      table.timestamp.desc(),
-      table.id.desc(),
-    ),
+   
+    primaryKey({
+      name: "logs_pkey",
+      columns: [table.timestamp, table.id],
+    }),
 
     index("idx_logs_service_timestamp_id").on(
       table.service,
