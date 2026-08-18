@@ -1,5 +1,4 @@
-import { createServer } from "node:http";
-import { handleRoutes } from "./routes/index.js";
+import { createApp } from "./app.js";
 import { deleteExpiredLogs } from "./retention/retention.service.js";
 
 const PORT = 8080;
@@ -31,17 +30,7 @@ async function runRetention() {
   }
 }
 
-const server = createServer(async (req, res) => {
-  if (await handleRoutes(req, res)) {
-    return;
-  }
-
-  res.writeHead(404, {
-    "Content-Type": "text/plain",
-  });
-
-  res.end("Not Found");
-});
+const server = createApp();
 
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`Server is running on port ${PORT}`);
