@@ -26,6 +26,37 @@ services:
 
   postgres:
     image: postgres:17-alpine
+    # PostgreSQL ships conservative defaults (shared_buffers=128MB, work_mem=4MB,
+    # max_wal_size=1GB) that ignore this container's 1G budget and, under sustained
+    # writes (~12MB/s of WAL measured here), force a checkpoint roughly every 85s.
+    # These flags size the server to the container and let the 300s checkpoint
+    # timer bind instead. Passed with -c so the whole config is reviewable here.
+    command:
+      - "postgres"
+      # Shared buffer pool: a quarter of the 1G limit (default 128MB).
+      - "-c"
+      - "shared_buffers=256MB"
+      
+      - "-c"
+      - "effective_cache_size=768MB"
+      # Per-node memory for query execution (default 4MB).
+      - "-c"
+      - "work_mem=16MB"
+      # Index builds (the partition migration) and vacuum.
+      - "-c"
+      - "maintenance_work_mem=128MB"
+      # WAL volume: a quarter of the 1G limit (default 1GB).
+      - "-c"
+      - "max_wal_size=4GB"
+      
+      - "-c"
+      - "min_wal_size=1GB"
+      # Checkpoint frequency: 300s (default 5min) or 90% of max_wal_size (default 1GB).
+      - "-c"
+      - "checkpoint_completion_target=0.9"
+     
+      - "-c"
+      - "wal_compression=lz4"
     environment:
       POSTGRES_DB: logs
       POSTGRES_USER: postgres

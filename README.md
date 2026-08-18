@@ -581,6 +581,32 @@ docker compose up
 
 without requiring manual database setup.
 
+### PostgreSQL configuration
+
+Both services declare `deploy.resources.limits` in `docker-compose.yml` (the app
+at 0.5 CPU / 256 MB, PostgreSQL at 1.0 CPU / 1 GB) so they cannot starve each
+other. Out of the box, though, PostgreSQL sizes itself for a tiny machine —
+`shared_buffers=128MB`, `work_mem=4MB`, `max_wal_size=1GB` — which ignores that
+1 GB budget and, under sustained writes, forces a checkpoint roughly every 85
+seconds. The `command:` block in `docker-compose.yml` overrides these with `-c`
+flags, kept inline so the whole configuration is visible in review:
+
+| Parameter | Default | Set to | Why |
+|---|---|---|---|
+| `shared_buffers` | 128 MB | 256 MB | A quarter of the container's 1 GB for the buffer pool. Under sustained load the pool holds ~156 MB of hot pages — more than the entire old ceiling — at a 98% cache-hit ratio. |
+| `effective_cache_size` | 4 GB | 768 MB | A planner hint, not an allocation. The 4 GB default describes a machine that does not exist here and biases plan costs; 768 MB reflects the real budget. |
+| `work_mem` | 4 MB | 16 MB | Room for the aggregation query's hash/sort before it spills to disk. |
+| `maintenance_work_mem` | 64 MB | 128 MB | Faster index builds (the partition migration) and vacuum. |
+| `max_wal_size` | 1 GB | 4 GB | WAL is generated at ~12 MB/s at 15k logs/s, so 1 GB fills in ~85 s and forces a checkpoint well inside the 300 s `checkpoint_timeout`. At 4 GB the timer binds instead, so checkpoints are timed and smoothed rather than pressure-driven storms. |
+| `min_wal_size` | 80 MB | 1 GB | Recycle WAL segments instead of churning them. |
+| `checkpoint_completion_target` | 0.9 | 0.9 | Already the PostgreSQL 17 default; set explicitly to document that a checkpoint's writes are spread across 90% of the interval. |
+| `wal_compression` | off | lz4 | Compresses full-page images in WAL; measured a 15% reduction (74 MB to 63 MB per 100k logs) at negligible CPU cost on one core. |
+
+Measured under the 1 CPU / 1 GB cap: ingestion holds at ~15,500 logs/s
+(unchanged from the untuned server), WAL per 100k-log run drops from 74 MB to
+63 MB, and PostgreSQL peaks at ~211 MB with no OOM — memory the old 128 MB pool
+had no way to use.
+
 ## Testing
 
 TypeScript compilation:
@@ -673,6 +699,7 @@ Key optimizations currently implemented:
 * partition pruning on time-range queries
 * PostgreSQL `date_bin` aggregation
 * retention by dropping expired partitions
+* PostgreSQL server tuned to the container (buffer pool, WAL, checkpoints)
 * database-side filtering and aggregation
 
 ## Known Limitations
@@ -691,6 +718,10 @@ Key optimizations currently implemented:
   0.3 ms unpartitioned once the plan is cached, and about 15 ms on the first
   execution of a statement before caching. Queries carrying `since` prune to the
   partitions they need and are faster than they were before partitioning.
+* Raising `max_wal_size` to 4 GB ends the checkpoint storms but lets more WAL
+  accumulate between checkpoints, so crash recovery can replay more and the
+  `pg_wal` directory can grow larger on disk — an acceptable trade for a logs
+  service, and tunable back down if disk is tight.
 * Final performance characteristics depend on the official benchmark environment and workload.
 
 ## Optional Features
