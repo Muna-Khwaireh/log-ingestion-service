@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import http from "node:http";
 import { createApp } from "../app.js";
 import { closeDb } from "../db/index.js";
 
@@ -301,6 +302,55 @@ test("POST /logs rejects malformed JSON as a client error", async () => {
 
     assert.deepEqual(await response.json(), {
       error: "invalid JSON body",
+    });
+  } finally {
+    await stopServer(server);
+  }
+});
+
+test("POST /logs rejects a body larger than the limit with 413", async () => {
+  const { server, baseUrl } = await startServer();
+
+  // Comfortably past the 16 MiB cap, and deliberately not valid JSON: the size
+  // guard has to fire before the body is ever handed to JSON.parse.
+  const oversized = "x".repeat(17 * 1024 * 1024);
+
+  try {
+    const { status, body } = await new Promise<{
+      status: number;
+      body: string;
+    }>((resolve) => {
+      const request = http.request(
+        `${baseUrl}/logs`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+        },
+        (response) => {
+          const parts: Buffer[] = [];
+
+          response.on("data", (part) => parts.push(Buffer.from(part)));
+          response.on("end", () =>
+            resolve({
+              status: response.statusCode ?? 0,
+              body: Buffer.concat(parts).toString("utf-8"),
+            }),
+          );
+        },
+      );
+
+      // The server closes the connection the moment the cap trips, so the tail
+      // of the upload fails to write. The 413 response has already been
+      // received by then, so this write error is expected, not a failure.
+      request.on("error", () => {});
+
+      request.write(oversized);
+      request.end();
+    });
+
+    assert.equal(status, 413);
+    assert.deepEqual(JSON.parse(body), {
+      error: "request body exceeds the 16 MB limit",
     });
   } finally {
     await stopServer(server);

@@ -148,6 +148,8 @@ Nested objects and arrays are rejected.
 
 Malformed JSON and completely invalid batches return HTTP 400.
 
+Request bodies are capped at 16 MB. A larger POST is rejected with HTTP 413 as soon as the cap is passed, before the body is buffered or parsed, so oversized uploads cannot exhaust memory.
+
 ---
 
 ### GET /logs

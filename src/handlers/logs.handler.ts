@@ -227,16 +227,68 @@ if (cursor !== undefined) {
     );
   }
 }
-async function readBody(req: IncomingMessage): Promise<unknown> {
-  const chunks: Buffer[] = [];
 
-  for await (const chunk of req) {
-    chunks.push(Buffer.from(chunk));
+const MAX_BODY_BYTES = 16 * 1024 * 1024; // 16 MiB
+
+class PayloadTooLargeError extends Error {
+  constructor() {
+    super("request body exceeds the maximum allowed size");
+    this.name = "PayloadTooLargeError";
   }
+}
 
-  const body = Buffer.concat(chunks).toString("utf-8");
+function readBody(req: IncomingMessage): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    let settled = false;
 
-  return JSON.parse(body);
+    req.on("data", (chunk: Buffer) => {
+      if (settled) {
+        // Past the cap: keep reading but discard, so memory stays bounded
+        // while the rest of the upload drains. Draining matters -- closing the
+        // socket with the body half-read triggers a TCP reset that would wipe
+        // out the 413 response before the client can read it.
+        return;
+      }
+
+      size += chunk.length;
+
+      if (size > MAX_BODY_BYTES) {
+        settled = true;
+        reject(new PayloadTooLargeError());
+        return;
+      }
+
+      chunks.push(chunk);
+    });
+
+    req.on("end", () => {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+
+      try {
+        resolve(JSON.parse(Buffer.concat(chunks).toString("utf-8")));
+      } catch (error) {
+        reject(error);
+      }
+    });
+
+    // A dropped or client-aborted upload surfaces as an 'error' on the
+    // request. Keep a listener attached for the whole request so it never
+    // becomes an unhandled 'error' that crashes the process.
+    req.on("error", (error) => {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      reject(error);
+    });
+  });
 }
 
 export async function handlePostLogs(
@@ -249,6 +301,22 @@ export async function handlePostLogs(
   try {
     body = await readBody(req);
   } catch (error) {
+    if (error instanceof PayloadTooLargeError) {
+      
+      res.writeHead(413, {
+        "Content-Type": "application/json",
+        Connection: "close",
+      });
+
+      res.end(
+        JSON.stringify({
+          error: "request body exceeds the 16 MB limit",
+        }),
+      );
+
+      return;
+    }
+
     console.error("Failed to read request body:", error);
 
     res.writeHead(400, {
