@@ -1,5 +1,5 @@
 import { and, desc, eq, gte, ilike, lt, or, sql } from "drizzle-orm";
-import { db } from "../db/index.js";
+import { getDb } from "../db/index.js";
 import { logs } from "../db/schema.js";
 import type {
   AggregateQuery,
@@ -17,7 +17,7 @@ export async function insertLogs(entries: NewLog[]) {
     return;
   }
 
-  await db.insert(logs).values(entries);
+  await getDb().insert(logs).values(entries);
 }
 
 export async function getLogs(query: LogQuery) {
@@ -63,7 +63,7 @@ if (query.until) {
     );
   }
 
-  const rows = await db
+  const rows = await getDb()
     .select()
     .from(logs)
     .where(conditions.length > 0 ? and(...conditions) : undefined)
@@ -117,7 +117,7 @@ export async function aggregateLogs(query: AggregateQuery) {
   `;
 
   if (query.groupBy === "service") {
-    return db
+    return getDb()
       .select({
         start: bucketStart,
         group: logs.service,
@@ -130,7 +130,7 @@ export async function aggregateLogs(query: AggregateQuery) {
   }
 
   if (query.groupBy === "level") {
-    return db
+    return getDb()
       .select({
         start: bucketStart,
         group: logs.level,
@@ -142,7 +142,7 @@ export async function aggregateLogs(query: AggregateQuery) {
       .orderBy(sql`1`);
   }
 
-  return db
+  return getDb()
     .select({
       start: bucketStart,
       group: sql<string | null>`NULL`,

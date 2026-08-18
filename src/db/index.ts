@@ -3,14 +3,24 @@ import postgres from "postgres";
 
 import * as schema from "./schema.js";
 
-const connectionString = process.env.DATABASE_URL;
+let dbInstance: ReturnType<typeof drizzle<typeof schema>> | undefined;
 
-if (!connectionString) {
-  throw new Error("DATABASE_URL is not set");
+export function getDb() {
+  if (dbInstance) {
+    return dbInstance;
+  }
+
+  const connectionString = process.env.DATABASE_URL;
+
+  if (!connectionString) {
+    throw new Error("DATABASE_URL is not set");
+  }
+
+  const client = postgres(connectionString);
+
+  dbInstance = drizzle(client, {
+    schema,
+  });
+
+  return dbInstance;
 }
-
-const client = postgres(connectionString);
-
-export const db = drizzle(client, {
-  schema,
-});

@@ -1,5 +1,5 @@
 import { sql } from "drizzle-orm";
-import { db } from "../db/index.js";
+import { getDb } from "../db/index.js";
 import { logs } from "../db/schema.js";
 
 export async function deleteExpiredLogs(
@@ -12,7 +12,7 @@ export async function deleteExpiredLogs(
 
   const cutoffIso = cutoff.toISOString();
 
-  const result = await db.execute(sql`
+  const result = await getDb().execute(sql`
     DELETE FROM ${logs}
     WHERE id IN (
       SELECT id
