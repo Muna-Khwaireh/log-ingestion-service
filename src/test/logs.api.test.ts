@@ -220,6 +220,71 @@ test("GET /logs compares attribute values as strings across JSON types", async (
   }
 });
 
+test("GET /logs treats LIKE metacharacters in q as literal text", async () => {
+  const { server, baseUrl } = await startServer();
+
+  const service = `like-escape-${Date.now()}-${Math.round(Math.random() * 1e6)}`;
+
+  const entry = (message: string) => ({
+    timestamp: new Date().toISOString(),
+    level: "info",
+    service,
+    message,
+  });
+
+  try {
+    const ingest = await fetch(`${baseUrl}/logs`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        logs: [
+          entry("order 1_ shipped"), // literal underscore
+          entry("order 12 shipped"), // an unescaped _ would match this too
+          entry("disk 90% full"), //   literal percent
+          entry("disk 9000 full"), //  an unescaped % would match this too
+          entry("path C:\\logs"), //   literal backslash
+          entry("path C:Xlogs"), //    a bare \ would swallow the next char
+        ],
+      }),
+    });
+
+    assert.equal(ingest.status, 200);
+
+    const search = async (q: string) => {
+      const response = await fetch(
+        `${baseUrl}/logs?service=${service}&q=${encodeURIComponent(q)}`,
+      );
+
+      assert.equal(response.status, 200);
+
+      const body = (await response.json()) as {
+        logs: { message: string }[];
+      };
+
+      return body.logs.map((log) => log.message).sort();
+    };
+
+   
+    assert.deepEqual(await search("order 1_ shipped"), ["order 1_ shipped"]);
+
+    
+    assert.deepEqual(await search("disk 90%"), ["disk 90% full"]);
+
+    
+    assert.deepEqual(await search("C:\\logs"), ["path C:\\logs"]);
+
+    
+    assert.deepEqual(await search("shipped"), [
+      "order 12 shipped",
+      "order 1_ shipped",
+    ]);
+  } finally {
+    await stopServer(server);
+  }
+});
+
 test("POST /logs rejects malformed JSON as a client error", async () => {
   const { server, baseUrl } = await startServer();
 

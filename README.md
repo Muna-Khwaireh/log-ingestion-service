@@ -312,6 +312,9 @@ Stored as text and indexed because service filtering is a common query pattern.
 Stored as text.
 
 Case-insensitive substring search is supported through the `q` query parameter.
+The value is matched literally: the `LIKE` metacharacters `%`, `_` and `\` are
+escaped, so `q=order 1_` finds the underscore itself rather than treating it as
+a single-character wildcard.
 
 ### Attributes
 

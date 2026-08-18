@@ -67,6 +67,10 @@ function attributeConditions(filters: Record<string, string>) {
   );
 }
 
+function containsPattern(messageQuery: string) {
+  return `%${messageQuery.replace(/[\\%_]/g, (ch) => `\\${ch}`)}%`;
+}
+
 export async function getLogs(query: LogQuery) {
   const conditions = [];
 
@@ -87,7 +91,7 @@ if (query.until) {
 }
 
   if (query.messageQuery) {
-    conditions.push(ilike(logs.message, `%${query.messageQuery}%`));
+    conditions.push(ilike(logs.message, containsPattern(query.messageQuery)));
   }
 
   if (query.attributeFilters) {
@@ -131,7 +135,7 @@ export async function aggregateLogs(query: AggregateQuery) {
   }
 
   if (query.messageQuery) {
-    conditions.push(ilike(logs.message, `%${query.messageQuery}%`));
+    conditions.push(ilike(logs.message, containsPattern(query.messageQuery)));
   }
 
   if (query.attributeFilters) {
