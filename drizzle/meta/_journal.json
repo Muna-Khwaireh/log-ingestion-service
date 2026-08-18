@@ -15,6 +15,13 @@
       "when": 1786982804429,
       "tag": "0001_ambitious_rafael_vega",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1787063167000,
+      "tag": "0002_add_message_trgm",
+      "breakpoints": true
     }
   ]
 }
