@@ -1,5 +1,6 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { ingestLogs, queryLogs } from "../services/logs.service.js";
+import type { IngestResult } from "../services/logs.service.js";
 import type {
   LogLevel,
   LogQuery,
@@ -242,47 +243,13 @@ export async function handlePostLogs(
   req: IncomingMessage,
   res: ServerResponse,
 ) {
+  
+  let body: unknown;
+
   try {
-    const body = await readBody(req);
-
-    if (
-      typeof body !== "object" ||
-      body === null ||
-      !("logs" in body) ||
-      !Array.isArray(body.logs)
-    ) {
-      res.writeHead(400, {
-        "Content-Type": "application/json",
-      });
-
-      res.end(
-        JSON.stringify({
-          error: "request body must contain a logs array",
-        }),
-      );
-
-      return;
-    }
-
-    const result = await ingestLogs(body.logs);
-
-    if (result.accepted === 0) {
-      res.writeHead(400, {
-        "Content-Type": "application/json",
-      });
-
-      res.end(JSON.stringify(result));
-
-      return;
-    }
-
-    res.writeHead(200, {
-      "Content-Type": "application/json",
-    });
-
-    res.end(JSON.stringify(result));
+    body = await readBody(req);
   } catch (error) {
-    console.error("Failed to ingest logs:", error);
+    console.error("Failed to read request body:", error);
 
     res.writeHead(400, {
       "Content-Type": "application/json",
@@ -293,7 +260,65 @@ export async function handlePostLogs(
         error: "invalid JSON body",
       }),
     );
+
+    return;
   }
+
+  if (
+    typeof body !== "object" ||
+    body === null ||
+    !("logs" in body) ||
+    !Array.isArray(body.logs)
+  ) {
+    res.writeHead(400, {
+      "Content-Type": "application/json",
+    });
+
+    res.end(
+      JSON.stringify({
+        error: "request body must contain a logs array",
+      }),
+    );
+
+    return;
+  }
+
+  let result: IngestResult;
+
+  try {
+    result = await ingestLogs(body.logs);
+  } catch (error) {
+    console.error("Failed to ingest logs:", error);
+
+    res.writeHead(503, {
+      "Content-Type": "application/json",
+      "Retry-After": "1",
+    });
+
+    res.end(
+      JSON.stringify({
+        error: "log storage is unavailable",
+      }),
+    );
+
+    return;
+  }
+
+  if (result.accepted === 0) {
+    res.writeHead(400, {
+      "Content-Type": "application/json",
+    });
+
+    res.end(JSON.stringify(result));
+
+    return;
+  }
+
+  res.writeHead(200, {
+    "Content-Type": "application/json",
+  });
+
+  res.end(JSON.stringify(result));
 }
 
 export async function handleAggregateLogs(

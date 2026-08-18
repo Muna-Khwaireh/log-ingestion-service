@@ -219,3 +219,73 @@ test("GET /logs compares attribute values as strings across JSON types", async (
     await stopServer(server);
   }
 });
+
+test("POST /logs rejects malformed JSON as a client error", async () => {
+  const { server, baseUrl } = await startServer();
+
+  try {
+    const response = await fetch(`${baseUrl}/logs`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: "{ this is not json",
+    });
+
+    assert.equal(response.status, 400);
+
+    assert.deepEqual(await response.json(), {
+      error: "invalid JSON body",
+    });
+  } finally {
+    await stopServer(server);
+  }
+});
+
+test("POST /logs reports a storage failure as 503, not as a client error", async () => {
+  const originalUrl = process.env.DATABASE_URL;
+
+  // Drop the cached connection so the next getDb() picks up the bad URL.
+  await closeDb();
+
+  process.env.DATABASE_URL =
+    "postgres://postgres:postgres@127.0.0.1:1/logs";
+
+  const { server, baseUrl } = await startServer();
+
+  try {
+    const response = await fetch(`${baseUrl}/logs`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        logs: [
+          {
+            timestamp: new Date().toISOString(),
+            level: "info",
+            service: "api-test",
+            message: "storage is unreachable",
+          },
+        ],
+      }),
+    });
+
+    
+    assert.equal(response.status, 503);
+    assert.equal(response.headers.get("retry-after"), "1");
+
+    assert.deepEqual(await response.json(), {
+      error: "log storage is unavailable",
+    });
+  } finally {
+    await stopServer(server);
+    await closeDb();
+
+    if (originalUrl === undefined) {
+      delete process.env.DATABASE_URL;
+    } else {
+      process.env.DATABASE_URL = originalUrl;
+    }
+  }
+});
