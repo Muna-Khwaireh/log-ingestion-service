@@ -78,11 +78,17 @@ Database migrations are automatically applied during application startup.
 
 ### GET /health
 
-Returns HTTP 200 once the service is ready.
+Verifies database connectivity with a `SELECT 1` and reports readiness:
+
+* `200 OK` — the database answered
+* `503 Service Unavailable` — the query failed, timed out, or `DATABASE_URL` is unset
 
 ```bash
 curl -i http://localhost:8080/health
 ```
+
+The database check is bounded by `HEALTH_DB_TIMEOUT_MS` (default `2000`), so an
+unreachable database fails the check instead of hanging the request.
 
 ---
 
