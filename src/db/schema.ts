@@ -42,12 +42,6 @@ export const logs = pgTable(
       table.id.desc(),
     ),
 
-    index("idx_logs_level_timestamp_id").on(
-      table.level,
-      table.timestamp.desc(),
-      table.id.desc(),
-    ),
-
     index("idx_logs_attributes").using(
       "gin",
       table.attributes,

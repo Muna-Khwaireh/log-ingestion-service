@@ -350,29 +350,50 @@ idx_logs_service_timestamp_id
 
 Supports queries filtering by service while maintaining efficient timestamp ordering.
 
-### Level + Timestamp + ID
-
-```text
-idx_logs_level_timestamp_id
-```
-
-Supports queries filtering by level while maintaining efficient timestamp ordering.
-
 ### JSONB GIN
 
 ```text
 idx_logs_attributes
 ```
 
-A GIN index is used for JSONB attribute containment queries.
+A GIN index is used for JSONB attribute queries.
 
-Attribute filtering uses PostgreSQL JSONB containment:
+Attribute values are compared as strings, so a stored number or boolean matches
+the string form supplied in the query:
 
 ```sql
-attributes @> '{"user_id":"42"}'::jsonb
+attributes ? 'user_id' AND attributes ->> 'user_id' = '42'
 ```
 
-This allows attribute queries to use the JSONB GIN index.
+Containment (`@>`) is not used, because it is type-strict: a stored
+`"retries": 3` would never match the string `"3"` arriving from the query
+string. The key existence check is GIN-indexable, so a selective attribute key
+still narrows the scan through `idx_logs_attributes` before the text
+comparison runs.
+
+### Index Budget
+
+Every index is maintained on each insert, so the index set is bounded by the
+ingestion target of 15,000 logs/second rather than by query convenience.
+
+Measured cost of a 200,000 row bulk insert:
+
+| index set | rows/second |
+| --- | --- |
+| all six original indexes | 27,700 |
+| without the message trigram index | 86,949 |
+| without the trigram and level indexes | 110,862 |
+
+Two indexes were removed in `0003_trim_write_heavy_indexes`:
+
+* `idx_logs_message_trgm` accounted for roughly 68% of insert time. With
+  `ORDER BY timestamp DESC LIMIT n` the planner walks `idx_logs_timestamp_id`
+  and filters, rather than using the trigram index, so common-term searches did
+  not benefit from it at all. It remains available as an opt-in through
+  `drizzle/optional/message_trgm.sql`.
+* `idx_logs_level_timestamp_id` covered a column with four distinct values.
+  Filtering by level through `idx_logs_timestamp_id` measured 0.119 ms against
+  0.087 ms with the dedicated index, which does not justify its write cost.
 
 ## Query Performance
 
@@ -570,7 +591,11 @@ Key optimizations currently implemented:
 
 ## Known Limitations
 
-* Message substring searches using `ILIKE '%query%'` are not backed by a specialized trigram index.
+* Message substring searches using `ILIKE '%query%'` are not backed by a
+  trigram index by default, because it dominated ingestion cost. It can be
+  enabled with `drizzle/optional/message_trgm.sql`. At 200,000 rows a
+  rare-term search measured approximately 89 ms without it against 9 ms with
+  it; common-term searches are unaffected either way.
 * JSONB attributes provide flexibility but are less restrictive than a normalized attribute table.
 * Retention uses batched deletion rather than partition-based expiration.
 * Final performance characteristics depend on the official benchmark environment and workload.
