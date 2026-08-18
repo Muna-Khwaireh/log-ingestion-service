@@ -289,3 +289,65 @@ test("POST /logs reports a storage failure as 503, not as a client error", async
     }
   }
 });
+
+test("POST /logs preserves messages containing COPY delimiters and quotes", async () => {
+  const { server, baseUrl } = await startServer();
+
+  const service = `copy-encoding-${Date.now()}-${Math.round(Math.random() * 1e6)}`;
+
+  const messages = [
+    "comma, separated",
+    'double "quoted" text',
+    "line one\nline two",
+    "tab\tseparated",
+    "backslash \ and \. terminator",
+    "unicode ✓ accented ü",
+  ];
+
+  const note = 'has "quotes", commas\nand newlines';
+
+  try {
+    const ingest = await fetch(`${baseUrl}/logs`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        logs: messages.map((message) => ({
+          timestamp: new Date().toISOString(),
+          level: "info",
+          service,
+          message,
+          attributes: { note },
+        })),
+      }),
+    });
+
+    assert.equal(ingest.status, 200);
+
+    const accepted = (await ingest.json()) as { accepted: number };
+
+    assert.equal(accepted.accepted, messages.length);
+
+    const response = await fetch(
+      `${baseUrl}/logs?service=${service}&limit=50`,
+    );
+
+    assert.equal(response.status, 200);
+
+    const body = (await response.json()) as {
+      logs: { message: string; attributes: Record<string, string> }[];
+    };
+
+    assert.deepEqual(
+      body.logs.map((log) => log.message).sort(),
+      [...messages].sort(),
+    );
+
+    for (const log of body.logs) {
+      assert.equal(log.attributes.note, note);
+    }
+  } finally {
+    await stopServer(server);
+  }
+});

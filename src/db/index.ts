@@ -6,24 +6,31 @@ import * as schema from "./schema.js";
 let dbInstance: ReturnType<typeof drizzle<typeof schema>> | undefined;
 let clientInstance: ReturnType<typeof postgres> | undefined;
 
-export function getDb() {
-  if (dbInstance) {
-    return dbInstance;
-  }
-
+function connect() {
   const connectionString = process.env.DATABASE_URL;
 
   if (!connectionString) {
     throw new Error("DATABASE_URL is not set");
   }
 
-  clientInstance = postgres(connectionString);
-
-  dbInstance = drizzle(clientInstance, {
+  const client = postgres(connectionString);
+  const db = drizzle(client, {
     schema,
   });
 
-  return dbInstance;
+  clientInstance = client;
+  dbInstance = db;
+
+  return { client, db };
+}
+
+export function getDb() {
+  return dbInstance ?? connect().db;
+}
+
+
+export function getClient() {
+  return clientInstance ?? connect().client;
 }
 
 export async function closeDb() {

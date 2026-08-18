@@ -1,5 +1,6 @@
 import { and, desc, eq, gte, ilike, lt, or, sql } from "drizzle-orm";
-import { getDb } from "../db/index.js";
+import { finished } from "node:stream/promises";
+import { getClient, getDb } from "../db/index.js";
 import { logs } from "../db/schema.js";
 import type {
   AggregateQuery,
@@ -12,12 +13,38 @@ import type {
   attributes: Record<string, string | number | boolean>;
 };
 
+
+function csvField(value: string) {
+  return '"' + value.replaceAll('"', '""') + '"';
+}
+
 export async function insertLogs(entries: NewLog[]) {
   if (entries.length === 0) {
     return;
   }
 
-  await getDb().insert(logs).values(entries);
+  const rows = entries.map(
+    (entry) =>
+      csvField(entry.timestamp.toISOString()) +
+      "," +
+      csvField(entry.level) +
+      "," +
+      csvField(entry.service) +
+      "," +
+      csvField(entry.message) +
+      "," +
+      csvField(JSON.stringify(entry.attributes)) +
+      "\n",
+  );
+
+  const stream = await getClient()`
+    COPY logs ("timestamp", "level", "service", "message", "attributes")
+    FROM STDIN WITH (FORMAT csv)
+  `.writable();
+
+  stream.end(rows.join(""));
+
+  await finished(stream);
 }
 
 /**
