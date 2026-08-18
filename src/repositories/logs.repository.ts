@@ -20,6 +20,26 @@ export async function insertLogs(entries: NewLog[]) {
   await getDb().insert(logs).values(entries);
 }
 
+/**
+ * Attribute values are compared as strings, so a stored number or boolean has
+ * to match a query string: ?attr.retries=3 matches a stored 3 as well as "3".
+ *
+ * "->>" extracts the value as text, which renders jsonb numbers and booleans
+ * the way the spec wants them compared. Plain "@>" containment cannot do this,
+ * because jsonb containment is type-strict and would never match a stored
+ * number against the string coming off the query string.
+ *
+ * The key-existence check is redundant for correctness, but it is GIN-indexable
+ * where "->>" is not, so a selective key still narrows the scan through
+ * idx_logs_attributes instead of forcing a sequential scan.
+ */
+function attributeConditions(filters: Record<string, string>) {
+  return Object.entries(filters).map(
+    ([key, value]) =>
+      sql`(${logs.attributes} ? ${key} AND ${logs.attributes} ->> ${key} = ${value})`,
+  );
+}
+
 export async function getLogs(query: LogQuery) {
   const conditions = [];
 
@@ -44,12 +64,8 @@ if (query.until) {
   }
 
   if (query.attributeFilters) {
-  for (const [key, value] of Object.entries(query.attributeFilters)) {
-    conditions.push(
-      sql`${logs.attributes} @> ${JSON.stringify({ [key]: value })}::jsonb`,
-    );
+    conditions.push(...attributeConditions(query.attributeFilters));
   }
-}
 
   if (query.cursor) {
     conditions.push(
@@ -92,12 +108,8 @@ export async function aggregateLogs(query: AggregateQuery) {
   }
 
   if (query.attributeFilters) {
-  for (const [key, value] of Object.entries(query.attributeFilters)) {
-    conditions.push(
-      sql`${logs.attributes} @> ${JSON.stringify({ [key]: value })}::jsonb`,
-    );
+    conditions.push(...attributeConditions(query.attributeFilters));
   }
-}
 
   const bucket = {
     "1m": "1 minute",
