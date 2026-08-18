@@ -118,13 +118,12 @@ export async function aggregateLogs(query: AggregateQuery) {
     "1d": "1 day",
   }[query.bucket];
 
-  const sinceIso = query.since.toISOString();
 
   const bucketStart = sql`
     date_bin(
-      ${sql.raw(`INTERVAL '${bucket}'`)},
+      ${bucket}::interval,
       ${logs.timestamp},
-      ${sql.raw(`TIMESTAMP '${sinceIso.replace("T", " ").replace("Z", "")}'`)}
+      ${query.since.toISOString()}::timestamptz
     )
   `;
 
