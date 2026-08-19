@@ -5,7 +5,7 @@
   "main": "dist/index.js",
   "scripts": {
   "build": "tsc",
-  "test": "npm run build && cd dist/test && node --test",
+  "test": "npm run build && node scripts/provision-test-partitions.mjs && cd dist/test && node --test",
   "smoke": "node scripts/smoke-test.mjs",
   "migrate": "drizzle-kit migrate",
   "start": "npm run migrate && node dist/index.js"
