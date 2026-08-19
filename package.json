@@ -6,6 +6,7 @@
   "scripts": {
   "build": "tsc",
   "test": "npm run build && node --test dist/test",
+  "smoke": "node scripts/smoke-test.mjs",
   "migrate": "drizzle-kit migrate",
   "start": "npm run migrate && node dist/index.js"
 },

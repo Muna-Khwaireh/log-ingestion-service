@@ -614,6 +614,45 @@ had no way to use.
 
 ## Testing
 
+### Automated tests
+
+The suite runs on Node's built-in test runner and covers validation, cursor
+encoding, retention, and full HTTP integration tests for every endpoint. The
+integration and retention tests talk to a real PostgreSQL, so `DATABASE_URL`
+must point at a reachable database:
+
+```bash
+DATABASE_URL=postgresql://postgres:postgres@localhost:5433/logs npm test
+```
+
+`npm test` builds first, so a type error also fails the run.
+
+### Smoke test
+
+`npm run smoke` boots the built server and checks that all four required
+endpoints answer with the expected status (`GET /health`, `POST /logs`,
+`GET /logs`, `GET /logs/aggregate`). It exits non-zero the moment any endpoint
+is unreachable or returns an unexpected status, so a broken route is caught
+rather than shipped.
+
+```bash
+npm run build
+DATABASE_URL=postgresql://postgres:postgres@localhost:5433/logs npm run smoke
+```
+
+The listen port is configurable with `SMOKE_PORT`. To probe a server that is
+already running instead of spawning one, set `SMOKE_BASE_URL` (for example
+`SMOKE_BASE_URL=http://localhost:8080 npm run smoke` against `docker compose`).
+
+### Continuous integration
+
+`.github/workflows/ci.yml` runs on every push and pull request to `main`. It
+starts a PostgreSQL service container, then builds, applies migrations, runs the
+full test suite, and finishes with the smoke test — so a change that breaks any
+endpoint turns the pipeline red instead of merging green.
+
+### Manual checks
+
 TypeScript compilation:
 
 ```bash

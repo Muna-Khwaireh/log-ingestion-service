@@ -9,8 +9,28 @@ on:
       - main
 
 jobs:
-  build:
+  build-and-test:
     runs-on: ubuntu-latest
+
+    env:
+      
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/logs
+
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: logs
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        
+        options: >-
+          --health-cmd "pg_isready -U postgres -d logs"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
 
     steps:
       - name: Checkout repository
@@ -27,3 +47,12 @@ jobs:
 
       - name: Build
         run: npm run build
+
+      - name: Run database migrations
+        run: npm run migrate
+
+      - name: Run tests
+        run: npm test
+
+      - name: Smoke test all four endpoints
+        run: npm run smoke

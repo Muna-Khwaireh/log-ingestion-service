@@ -4,8 +4,6 @@ import {
   type RetentionConfig,
 } from "./retention/retention.service.js";
 
-const PORT = 8080;
-
 function numberFromEnv(name: string, fallback: number) {
   const raw = process.env[name];
 
@@ -25,6 +23,8 @@ function numberFromEnv(name: string, fallback: number) {
 
   return value;
 }
+
+const PORT = numberFromEnv("PORT", 8080);
 
 const retentionIntervalMs = numberFromEnv(
   "RETENTION_INTERVAL_MS",
