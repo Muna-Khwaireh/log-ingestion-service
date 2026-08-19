@@ -1,5 +1,6 @@
 import { and, desc, eq, gte, ilike, lt, or, sql } from "drizzle-orm";
 import { once } from "node:events";
+import type { Writable } from "node:stream";
 import { finished } from "node:stream/promises";
 import { getClient, getDb } from "../db/index.js";
 import { logs } from "../db/schema.js";
@@ -15,46 +16,12 @@ import type {
 };
 
 
-/**
- * Escapes a CSV field's contents. Every field is quoted unconditionally by the
- * caller, so the only character needing treatment is the quote itself.
- *
- * The common case -- a field containing no quote at all -- returns the original
- * string untouched rather than allocating a replacement. That matters more than
- * it looks: CPU profiling under small-batch load put the garbage collector at
- * roughly a quarter of all active CPU, so on this path allocation count is the
- * cost, not instruction count.
- */
 function csvEscape(value: string) {
   return value.indexOf('"') === -1 ? value : value.replaceAll('"', '""');
 }
 
-/** Rows serialised per write, so a large flush never materialises the whole
- *  CSV payload in memory at once. */
 const CSV_CHUNK_ROWS = 500;
 
-/**
- * A COPY taking longer than this is logged with a per-phase breakdown.
- *
- * Under load, individual requests have been observed waiting far longer than
- * the queue depth can account for, with both containers close to idle -- the
- * signature of something blocking rather than something working. Timing the
- * phases separately is what distinguishes a slow commit from a starved
- * connection pool from socket backpressure.
- */
-const SLOW_FLUSH_MS = (() => {
-  const value = Number(process.env.INGEST_SLOW_FLUSH_MS);
-  return Number.isInteger(value) && value > 0 ? value : 1_000;
-})();
-
-/**
- * Builds one CSV record as a single concatenation.
- *
- * The quotes and separators are folded into the expression instead of each
- * field being wrapped by a helper that returns its own string. The previous
- * shape allocated two intermediate strings per field -- ten per row -- purely
- * to add quotes that are constant.
- */
 function csvRow(entry: NewLog) {
   return (
     '"' +
@@ -71,49 +38,38 @@ function csvRow(entry: NewLog) {
   );
 }
 
-/**
- * Bulk-inserts with COPY, which is far cheaper per row than multi-row INSERT.
- *
- * The CSV is written in chunks rather than joined into one string: a flush can
- * carry tens of thousands of rows, and building the entire payload (plus the
- * array of per-row strings behind it) was a second full copy of the batch in a
- * 256 MB container. Backpressure from the socket is respected so a slow write
- * cannot make the buffer grow without bound.
- *
- * postgres.js finishes the writable only once PostgreSQL answers
- * CommandComplete, so awaiting it means the rows are committed, not merely
- * flushed to the socket.
- */
-export async function insertLogs(entries: NewLog[]) {
-  if (entries.length === 0) {
-    return;
+const FLUSH_TIMEOUT_MS = (() => {
+  const value = Number(process.env.INGEST_FLUSH_TIMEOUT_MS);
+  return Number.isInteger(value) && value > 0 ? value : 10_000;
+})();
+
+/** Raised when a COPY exceeds FLUSH_TIMEOUT_MS and is abandoned. */
+export class FlushTimeoutError extends Error {
+  constructor(ms: number) {
+    super(`ingest flush did not complete within ${ms}ms`);
+    this.name = "FlushTimeoutError";
   }
+}
 
-  const startedAt = performance.now();
-
-  // Phase 1 -- acquire. Covers waiting for a pooled connection and for
-  // PostgreSQL to enter COPY mode.
+async function copyRows(
+  entries: NewLog[],
+  onStream: (stream: Writable) => void,
+) {
   const stream = await getClient()`
     COPY logs ("timestamp", "level", "service", "message", "attributes")
     FROM STDIN WITH (FORMAT csv)
   `.writable();
 
-  const acquiredAt = performance.now();
+  onStream(stream);
 
   let chunk = "";
-  let drainMs = 0;
 
   for (let index = 0; index < entries.length; index += 1) {
     chunk += csvRow(entries[index]!);
 
     if ((index + 1) % CSV_CHUNK_ROWS === 0) {
       if (!stream.write(chunk)) {
-        // Phase 2a -- socket backpressure. Timed separately because a stall
-        // here means the server is not draining what we send, which is a very
-        // different fault from a slow commit.
-        const drainStart = performance.now();
         await once(stream, "drain");
-        drainMs += performance.now() - drainStart;
       }
 
       chunk = "";
@@ -124,39 +80,51 @@ export async function insertLogs(entries: NewLog[]) {
     stream.write(chunk);
   }
 
-  const writtenAt = performance.now();
-
   stream.end();
 
-  // Phase 3 -- commit. postgres.js settles this only on CommandComplete, so
-  // this span is PostgreSQL executing and committing the COPY.
   await finished(stream);
+}
 
-  const total = performance.now() - startedAt;
+export async function insertLogs(entries: NewLog[]) {
+  if (entries.length === 0) {
+    return;
+  }
 
-  if (total >= SLOW_FLUSH_MS) {
-    console.warn(
-      `Slow COPY: ${Math.round(total)}ms for ${entries.length} rows ` +
-        `(acquire ${Math.round(acquiredAt - startedAt)}ms, ` +
-        `write ${Math.round(writtenAt - acquiredAt)}ms incl ${Math.round(drainMs)}ms drain, ` +
-        `commit ${Math.round(performance.now() - writtenAt)}ms)`,
-    );
+  let stream: Writable | undefined;
+  let timer: NodeJS.Timeout | undefined;
+  let timedOut = false;
+
+  const copy = copyRows(entries, (opened) => {
+    stream = opened;
+  });
+
+  copy.catch(() => {});
+
+  try {
+    await Promise.race([
+      copy,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => {
+          timedOut = true;
+          reject(new FlushTimeoutError(FLUSH_TIMEOUT_MS));
+        }, FLUSH_TIMEOUT_MS);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+
+    if (timedOut) {
+      console.error(
+        `Ingest flush timed out after ${FLUSH_TIMEOUT_MS}ms; ` +
+          `abandoning ${entries.length} rows and tearing down the connection`,
+      );
+
+     
+      stream?.destroy(new Error("ingest flush timed out"));
+    }
   }
 }
 
-/**
- * Attribute values are compared as strings, so a stored number or boolean has
- * to match a query string: ?attr.retries=3 matches a stored 3 as well as "3".
- *
- * "->>" extracts the value as text, which renders jsonb numbers and booleans
- * the way the spec wants them compared. Plain "@>" containment cannot do this,
- * because jsonb containment is type-strict and would never match a stored
- * number against the string coming off the query string.
- *
- * The key-existence check is redundant for correctness, but it is GIN-indexable
- * where "->>" is not, so a selective key still narrows the scan through
- * idx_logs_attributes instead of forcing a sequential scan.
- */
 function attributeConditions(filters: Record<string, string>) {
   return Object.entries(filters).map(
     ([key, value]) =>
