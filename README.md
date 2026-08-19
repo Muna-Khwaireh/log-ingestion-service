@@ -726,13 +726,97 @@ The project is designed to support:
 * aggregation during ingestion
 * queryability of newly ingested logs within the required time window
 
+### Load-Test Methodology
+
+All figures below come from `scripts/bench.mjs`, run from the host against the
+service in Docker with the graded container limits applied.
+
+**Load model.** The harness is *closed-loop*: it starts `--concurrency` workers,
+and each worker sends one batch, waits for the response, then immediately sends
+the next. It therefore measures **maximum sustainable throughput** at a given
+concurrency rather than holding a fixed target rate. This differs from the
+grading load generator, which is open-loop and drives a fixed offered rate
+(15,000 logs/s); a closed-loop harness cannot overload the service the same way,
+so overload behaviour is exercised by raising concurrency instead.
+
+**Parameters** (defaults as implemented in `scripts/bench.mjs`):
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--url` | `http://localhost:8080` | Base URL of the service under test. |
+| `--duration` | `30` | Seconds to generate load. Workers finish their in-flight request afterwards, so actual elapsed time can exceed this; throughput is computed against **actual** elapsed time. |
+| `--batch` | `500` | Log entries per `POST /logs` request. |
+| `--concurrency` | `32` | Concurrent writers. |
+| `--no-aggregate` | *(off)* | Disables the concurrent aggregation probe. |
+
+**Generated data.** Each entry cycles deterministically so the dataset has
+realistic cardinality: 10 services (`service-0` … `service-9`), all 4 levels,
+and attributes `user_id` (1000 distinct string values), `region` (3 values) and
+`retries` (a number, 0–3) — exercising both string and numeric attribute
+storage. All entries within one batch share a single timestamp taken when the
+batch is built.
+
+**Concurrent query load.** Unless disabled, one `GET /logs/aggregate` is issued
+per second for the whole run — matching the brief's *"one aggregation request
+per second during the ingestion test"*. The probe queries the **last hour** with
+`bucket=1m&group_by=service`, and its latency is reported separately from
+ingestion.
+
+**Metrics.** Throughput is `accepted logs ÷ actual elapsed seconds`, counting
+only entries the service reported as accepted. Latency percentiles are computed
+by nearest rank over every recorded request latency. Requests that return a
+non-200 status or throw are counted as failures and reported in the status mix,
+so shed (`503`) requests are visible rather than hidden.
+
+### Reproducing the benchmark
+
+```bash
+docker compose up -d --build
+curl -i http://localhost:8080/health          # wait for 200 before starting
+node scripts/bench.mjs --duration=30 --batch=500 --concurrency=32
+```
+
+The recorded overload comparison used a heavier profile:
+
+```bash
+node scripts/bench.mjs --duration=25 --batch=1000 --concurrency=128
+```
+
+Resource usage and dataset size were sampled with:
+
+```bash
+docker stats --no-stream --format "{{.Name}} {{.CPUPerc}} {{.MemUsage}}"
+docker compose exec postgres psql -U postgres -d logs -c "SELECT count(*) FROM logs;"
+```
+
+Container limits were confirmed actually applied, rather than assumed, with:
+
+```bash
+docker inspect log-ingestion-service-app-1 --format '{{.HostConfig.NanoCpus}} {{.HostConfig.Memory}}'
+```
+
+`scripts/load-test.mjs` is a simpler fixed-volume script (100,000 logs, batch
+500, concurrency 10) kept for quick sanity checks; it reports only total rate,
+not latency percentiles.
+
+### Limitations of this methodology
+
+* The harness runs on the **same host** as the containers, so it competes for
+  host CPU. This biases results *downward* relative to an isolated generator.
+* Closed-loop load cannot reproduce the grading generator's open-loop overload
+  exactly; concurrency is used as a proxy.
+* The dataset **grew across successive runs** rather than being reset, so later
+  runs carry more index-maintenance cost per insert. Figures are reported with
+  the row count they were measured at.
+
 ### Benchmark Environment
 
-Measured with `node scripts/bench.mjs`, which drives `POST /logs` from a fixed
-pool of concurrent writers while issuing one `GET /logs/aggregate` per second,
-exactly as the grading load generator does. Container limits were confirmed
-applied (`docker inspect`: app `NanoCpus=500000000`, `Memory=268435456`;
-PostgreSQL `NanoCpus=1000000000`, `Memory=1073741824`).
+Measured with `node scripts/bench.mjs` as described in
+[Load-Test Methodology](#load-test-methodology): a fixed pool of concurrent
+writers driving `POST /logs`, with one `GET /logs/aggregate` per second
+alongside. Container limits were confirmed applied (`docker inspect`: app
+`NanoCpus=500000000`, `Memory=268435456`; PostgreSQL `NanoCpus=1000000000`,
+`Memory=1073741824`).
 
 ```text
 Host:              Docker Desktop (WSL2), Windows 11
@@ -786,13 +870,13 @@ of the batch in a 256 MB container. Now serialised in 500-row chunks honouring
 stream backpressure.
 
 **Measured anti-optimization — buffer depth.** Making the ingestion buffer
-*deeper* is actively harmful. Raising `INGEST_MAX_PENDING_ROWS` from 25k to 100k
-dropped throughput from 18,089 to 5,017 logs/s and pushed p95 from 7.6 s to
-70 s — textbook bufferbloat, since a deeper queue only adds waiting once the
-writer is already saturated. The default is tuned to roughly one second of
-drain at measured throughput; beyond that the service sheds with 503 +
-`Retry-After`, which is both faster for the client and safer than buffering into
-an OOM kill.
+*deeper* is actively harmful. Under identical overload (128 concurrent writers,
+1000-row batches), raising `INGEST_MAX_PENDING_ROWS` from 50k to 100k dropped
+throughput from 18,089 to 5,017 logs/s and pushed p95 from 7.6 s to 70 s —
+textbook bufferbloat, since a deeper queue only adds waiting once the writer is
+already saturated. The default is tuned to roughly one second of drain at
+measured throughput; beyond that the service sheds with 503 + `Retry-After`,
+which is both faster for the client and safer than buffering into an OOM kill.
 
 **Current ceiling.** The application container is now the bottleneck: Node is
 single-threaded and pinned at ~49% of its 0.5-core limit while PostgreSQL still
@@ -838,17 +922,99 @@ Key optimizations currently implemented:
 
 ## Optional Features
 
-Optional features will be documented here as they are implemented.
+One optional feature is implemented: **backpressure support**. Authentication,
+API keys, multi-tenancy and rate limiting are **not** implemented, so the service
+has no credential handling and no per-client quotas of any kind.
 
-Each optional feature will include:
+### Backpressure support
 
-* feature description
-* default state
-* configuration variables
-* enable/disable instructions
-* compatibility with the required API contract
+Ingestion buffers rows and writes them in grouped `COPY` batches (see
+[Performance Benchmark](#performance-benchmark)). If producers outrun the
+writer, the buffer would grow until the 256 MB container is OOM-killed — which
+is exactly what happened before this existed: the application container died
+mid-run and, with no restart policy, stayed down.
 
-The default `docker compose up` configuration remains compatible with the required core API.
+Instead, once more than `INGEST_MAX_PENDING_ROWS` rows are waiting, `POST /logs`
+answers:
+
+```http
+HTTP/1.1 503 Service Unavailable
+Retry-After: 1
+Content-Type: application/json
+
+{"error": "ingestion is overloaded, retry shortly"}
+```
+
+**Default state: active, and not configurable off by design.** It is a safety
+valve rather than a policy — the alternative to shedding is crashing.
+
+**This is not a rate limit or a quota.** There is no per-client accounting, no
+request ceiling, and no fixed logs/second cap. It engages only when the write
+path is genuinely saturated, and at the required throughput it never engages at
+all: the benchmark sustained **22,974 logs/s with 0 shed requests and a 100%
+success rate**. The project brief sanctions this explicitly — *"shedding load
+with 429 or 503 plus Retry-After is better than crashing"* — while also noting
+that shed requests count as not ingested. That trade-off is accepted knowingly:
+a shed request costs throughput, a crashed container costs everything after it.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `INGEST_MAX_PENDING_ROWS` | `25000` | Rows allowed to wait before shedding with 503. Roughly one second of drain at measured throughput. |
+| `INGEST_MAX_FLUSH_ROWS` | `10000` | Upper bound on rows in a single `COPY`. |
+| `INGEST_FLUSH_CONCURRENCY` | `2` | Concurrent flushes in flight. |
+
+Raising `INGEST_MAX_PENDING_ROWS` widens the buffer before shedding begins, but
+**measurement showed this is counter-productive**. Under identical overload
+(128 concurrent writers, 1000-row batches):
+
+| `INGEST_MAX_PENDING_ROWS` | Throughput | p95 latency |
+|---|---|---|
+| `50000` | 18,089 logs/s | 7.6 s |
+| `100000` | 5,017 logs/s | 70 s |
+
+A deeper queue only adds waiting once the writer is already saturated, so the
+default is tuned to roughly one second of drain rather than to the largest
+buffer that fits in memory.
+
+**Compatibility with the required API contract.** The feature is additive and
+satisfies the Golden Rule: it adds no endpoint, removes none, changes no
+response shape, and introduces no required request parameter or header. The
+`503` is a documented status on an existing endpoint under saturation, not a new
+failure mode for requests that would otherwise have succeeded.
+
+### Default posture: zero configuration
+
+A plain `docker compose up`, with no environment file, no arguments and no
+manual setup, yields the plain core service:
+
+* `GET /health`, `POST /logs`, `GET /logs` and `GET /logs/aggregate` behave
+  exactly as specified
+* all four accept unauthenticated requests — there is no auth code path to enable
+* no rate limit, quota, or tenancy restriction is applied
+* migrations run automatically at startup
+
+Every variable below is optional and has a working default. `DATABASE_URL` is
+the only required one, and `docker-compose.yml` already sets it.
+
+### Environment variable reference
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `DATABASE_URL` | — (set by compose) | PostgreSQL connection string. |
+| `PORT` | `8080` | HTTP listen port. |
+| `DATABASE_POOL_MAX` | `24` | Maximum pooled PostgreSQL connections. |
+| `DATABASE_CONNECT_TIMEOUT_S` | `10` | Seconds to wait for a connection before failing. |
+| `INGEST_MAX_PENDING_ROWS` | `25000` | Backpressure threshold (above). |
+| `INGEST_MAX_FLUSH_ROWS` | `10000` | Rows per `COPY` (above). |
+| `INGEST_FLUSH_CONCURRENCY` | `2` | Concurrent flushes (above). |
+| `SHUTDOWN_TIMEOUT_MS` | `10000` | Grace period before a shutdown is forced. |
+| `HEALTH_DB_TIMEOUT_MS` | `2000` | Timeout for the `GET /health` database check. |
+| `RETENTION_DAYS` | `30` | Age at which logs expire. |
+| `RETENTION_INTERVAL_MS` | `3600000` | Interval between retention passes. |
+| `RETENTION_PARTITION_HOURS` | `24` | Width of each time partition. |
+| `RETENTION_PARTITIONS_AHEAD` | `2` | Partitions pre-created ahead of now. |
+| `RETENTION_BATCH_SIZE` | `10000` | Rows per delete batch in the default-partition sweep. |
+| `RETENTION_LOCK_TIMEOUT_MS` | `3000` | Lock timeout for partition maintenance. |
 
 ## Project Structure
 
