@@ -1,5 +1,5 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { ingestLogs, queryLogs } from "../services/logs.service.js";
+import { aggregate, ingestLogs, queryLogs } from "../services/logs.service.js";
 import type { IngestResult } from "../services/logs.service.js";
 import type {
   AggregateBucket,
@@ -9,7 +9,6 @@ import type {
 } from "../logs/log.types.js";
 import { LOG_LEVELS } from "../logs/log.types.js";
 import { decodeCursor } from "../logs/log.cursor.js";
-import { aggregateLogs } from "../repositories/logs.repository.js";
 
 /** The query parameters shared by GET /logs and GET /logs/aggregate. */
 type CommonFilters = Pick<
@@ -419,7 +418,7 @@ export async function handleAggregateLogs(
       query.groupBy = groupByParam;
     }
 
-    const result = await aggregateLogs(query);
+    const result = await aggregate(query);
 
     res.writeHead(200, {
       "Content-Type": "application/json",

@@ -1,5 +1,9 @@
-import type { LogQuery } from "../logs/log.types.js";
-import { getLogs, insertLogs } from "../repositories/logs.repository.js";
+import type { AggregateQuery, LogQuery } from "../logs/log.types.js";
+import {
+  aggregateLogs,
+  getLogs,
+  insertLogs,
+} from "../repositories/logs.repository.js";
 import {
   validateLog,
   type ValidatedLog,
@@ -63,4 +67,9 @@ const nextCursor =
     logs,
     next_cursor: nextCursor,
   };
+}
+
+
+export async function aggregate(query: AggregateQuery) {
+  return aggregateLogs(query);
 }
