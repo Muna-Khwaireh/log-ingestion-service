@@ -1,6 +1,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { aggregate, ingestLogs, queryLogs } from "../services/logs.service.js";
 import type { IngestResult } from "../services/logs.service.js";
+import { IngestBufferFullError } from "../services/ingest.buffer.js";
 import type {
   AggregateBucket,
   AggregateQuery,
@@ -315,6 +316,24 @@ export async function handlePostLogs(
   try {
     result = await ingestLogs(body.logs);
   } catch (error) {
+    if (error instanceof IngestBufferFullError) {
+      // Shedding load is the honest answer here: the writer is behind, and
+      // buffering further would end in an OOM kill. Retry-After tells the
+      // client to come back rather than treating this as a permanent failure.
+      res.writeHead(503, {
+        "Content-Type": "application/json",
+        "Retry-After": "1",
+      });
+
+      res.end(
+        JSON.stringify({
+          error: "ingestion is overloaded, retry shortly",
+        }),
+      );
+
+      return;
+    }
+
     console.error("Failed to ingest logs:", error);
 
     res.writeHead(503, {

@@ -1,4 +1,5 @@
 import { and, desc, eq, gte, ilike, lt, or, sql } from "drizzle-orm";
+import { once } from "node:events";
 import { finished } from "node:stream/promises";
 import { getClient, getDb } from "../db/index.js";
 import { logs } from "../db/schema.js";
@@ -18,31 +19,67 @@ function csvField(value: string) {
   return '"' + value.replaceAll('"', '""') + '"';
 }
 
+/** Rows serialised per write, so a large flush never materialises the whole
+ *  CSV payload in memory at once. */
+const CSV_CHUNK_ROWS = 500;
+
+function csvRow(entry: NewLog) {
+  return (
+    csvField(entry.timestamp.toISOString()) +
+    "," +
+    csvField(entry.level) +
+    "," +
+    csvField(entry.service) +
+    "," +
+    csvField(entry.message) +
+    "," +
+    csvField(JSON.stringify(entry.attributes)) +
+    "\n"
+  );
+}
+
+/**
+ * Bulk-inserts with COPY, which is far cheaper per row than multi-row INSERT.
+ *
+ * The CSV is written in chunks rather than joined into one string: a flush can
+ * carry tens of thousands of rows, and building the entire payload (plus the
+ * array of per-row strings behind it) was a second full copy of the batch in a
+ * 256 MB container. Backpressure from the socket is respected so a slow write
+ * cannot make the buffer grow without bound.
+ *
+ * postgres.js finishes the writable only once PostgreSQL answers
+ * CommandComplete, so awaiting it means the rows are committed, not merely
+ * flushed to the socket.
+ */
 export async function insertLogs(entries: NewLog[]) {
   if (entries.length === 0) {
     return;
   }
-
-  const rows = entries.map(
-    (entry) =>
-      csvField(entry.timestamp.toISOString()) +
-      "," +
-      csvField(entry.level) +
-      "," +
-      csvField(entry.service) +
-      "," +
-      csvField(entry.message) +
-      "," +
-      csvField(JSON.stringify(entry.attributes)) +
-      "\n",
-  );
 
   const stream = await getClient()`
     COPY logs ("timestamp", "level", "service", "message", "attributes")
     FROM STDIN WITH (FORMAT csv)
   `.writable();
 
-  stream.end(rows.join(""));
+  let chunk = "";
+
+  for (let index = 0; index < entries.length; index += 1) {
+    chunk += csvRow(entries[index]!);
+
+    if ((index + 1) % CSV_CHUNK_ROWS === 0) {
+      if (!stream.write(chunk)) {
+        await once(stream, "drain");
+      }
+
+      chunk = "";
+    }
+  }
+
+  if (chunk.length > 0) {
+    stream.write(chunk);
+  }
+
+  stream.end();
 
   await finished(stream);
 }

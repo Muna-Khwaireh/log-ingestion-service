@@ -1,6 +1,8 @@
 services:
   app:
     build: .
+    
+    restart: unless-stopped
     ports:
       - "8080:8080"
     environment:
@@ -26,6 +28,7 @@ services:
 
   postgres:
     image: postgres:17-alpine
+    restart: unless-stopped
     # PostgreSQL ships conservative defaults (shared_buffers=128MB, work_mem=4MB,
     # max_wal_size=1GB) that ignore this container's 1G budget and, under sustained
     # writes (~12MB/s of WAL measured here), force a checkpoint roughly every 85s.

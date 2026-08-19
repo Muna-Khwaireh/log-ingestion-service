@@ -1,5 +1,6 @@
 import { createApp } from "./app.js";
 import { closeDb } from "./db/index.js";
+import { drainIngestBuffer } from "./services/ingest.buffer.js";
 import {
   runRetention,
   type RetentionConfig,
@@ -131,6 +132,11 @@ async function shutdown(signal: NodeJS.Signals) {
 
    
     await activeRetention;
+
+    // Rows already accepted into the ingestion buffer must reach PostgreSQL
+    // before the pool closes, or shutdown would drop writes whose requests are
+    // still waiting on them.
+    await drainIngestBuffer();
 
     await closeDb();
 

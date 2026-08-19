@@ -2,8 +2,8 @@ import type { AggregateQuery, LogQuery } from "../logs/log.types.js";
 import {
   aggregateLogs,
   getLogs,
-  insertLogs,
 } from "../repositories/logs.repository.js";
+import { enqueueLogs } from "./ingest.buffer.js";
 import {
   validateLog,
   type ValidatedLog,
@@ -41,7 +41,9 @@ export async function ingestLogs(
   }
 
   if (validLogs.length > 0) {
-    await insertLogs(validLogs);
+    // Hands the rows to the group-commit buffer and waits for the COPY that
+    // carries them, so a 200 still means "durably stored".
+    await enqueueLogs(validLogs);
   }
 
   return {

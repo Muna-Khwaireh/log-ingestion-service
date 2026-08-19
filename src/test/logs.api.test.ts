@@ -318,6 +318,57 @@ test("GET /logs and /logs/aggregate validate shared filters identically", async 
   }
 });
 
+test("concurrent batches are all durable once POST /logs returns 200", async () => {
+  const { server, baseUrl } = await startServer();
+
+  // Enough concurrent requests to be coalesced into shared flushes by the
+  // group-commit buffer, which is exactly the case that must not lose rows.
+  const BATCHES = 12;
+  const PER_BATCH = 25;
+
+  const service = `groupcommit-${Date.now()}-${Math.round(Math.random() * 1e6)}`;
+
+  try {
+    const responses = await Promise.all(
+      Array.from({ length: BATCHES }, (_, batch) =>
+        fetch(`${baseUrl}/logs`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            logs: Array.from({ length: PER_BATCH }, (_, i) => ({
+              timestamp: new Date().toISOString(),
+              level: "info",
+              service,
+              message: `batch ${batch} entry ${i}`,
+            })),
+          }),
+        }),
+      ),
+    );
+
+    for (const response of responses) {
+      assert.equal(response.status, 200);
+
+      const body = (await response.json()) as { accepted: number };
+      assert.equal(body.accepted, PER_BATCH);
+    }
+
+    // Read immediately, with no delay: a 200 must mean the rows are already
+    // committed, not merely queued for a later flush.
+    const query = await fetch(
+      `${baseUrl}/logs?service=${service}&limit=1000`,
+    );
+
+    assert.equal(query.status, 200);
+
+    const body = (await query.json()) as { logs: unknown[] };
+
+    assert.equal(body.logs.length, BATCHES * PER_BATCH);
+  } finally {
+    await stopServer(server);
+  }
+});
+
 test("POST /logs rejects malformed JSON as a client error", async () => {
   const { server, baseUrl } = await startServer();
 

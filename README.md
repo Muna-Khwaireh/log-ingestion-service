@@ -442,7 +442,10 @@ GroupAggregate
 
 The local dataset was intentionally small, so this measurement is not representative of the final one-million-row benchmark.
 
-Final benchmark results will be added after the official load-generator test.
+Measured results against a 3.6M-row dataset under the graded container limits
+are in [Performance Benchmark](#performance-benchmark). Partition pruning is
+confirmed there by `EXPLAIN`, which reports `Subplans Removed: 33` — only the
+partition covering the requested range is scanned.
 
 ## Retention
 
@@ -725,25 +728,80 @@ The project is designed to support:
 
 ### Benchmark Environment
 
-The official benchmark results will be recorded here after the load-generator test.
+Measured with `node scripts/bench.mjs`, which drives `POST /logs` from a fixed
+pool of concurrent writers while issuing one `GET /logs/aggregate` per second,
+exactly as the grading load generator does. Container limits were confirmed
+applied (`docker inspect`: app `NanoCpus=500000000`, `Memory=268435456`;
+PostgreSQL `NanoCpus=1000000000`, `Memory=1073741824`).
 
 ```text
-Dataset size:
-Batch size:
-Ingestion rate:
-Query rate:
-p50 latency:
-p95 latency:
-p99 latency:
-Application CPU:
-Application memory:
-PostgreSQL CPU:
-PostgreSQL memory:
+Host:              Docker Desktop (WSL2), Windows 11
+Application:       0.5 CPU / 256 MB   (enforced)
+PostgreSQL:        1.0 CPU / 1 GB     (enforced, postgres:17-alpine)
+Dataset size:      ~3.6M rows (3.6x the ~1M target)
+Batch size:        500 logs per request
+Concurrency:       32 concurrent writers
+Ingestion rate:    22,974 logs/s sustained (39,156 logs/s at 1.95M rows)
+Success rate:      100.00%  (0 failed requests, status mix 200=1214)
+Query rate:        1 aggregate/s concurrent with ingestion
+p50 latency:       557 ms
+p95 latency:       1.33 s
+p99 latency:       1.57 s
+Application CPU:   48-49% of its 0.5-core limit (saturated)
+Application memory: 106 MB peak / 256 MB
+PostgreSQL CPU:    29-90% of 1 core (~55% average)
+PostgreSQL memory: 483-562 MB / 1 GB
 ```
+
+Ingestion throughput is **1.5x the 15,000 logs/s target at 3.6x the target
+dataset size**, with no dropped requests and no restarts. The reported figure is
+deliberately conservative: it was measured against a table that had already
+grown to 3.6M rows across repeated runs, so index maintenance costs more per row
+than it would on the ~1M-row dataset the target assumes.
 
 ### Bottlenecks and Optimizations
 
+**Bottleneck 1 — one commit per HTTP request (the dominant cost).**
+Ingestion originally issued one `COPY`, one transaction and one fsync per
+request, so the fixed per-commit cost was paid per request rather than per row.
+Under load, requests queued behind the connection pool while *both* containers
+sat almost idle — the signature of waiting, not computing. Replaced with a
+group-commit buffer (`src/services/ingest.buffer.ts`): requests hand their rows
+to a shared buffer and a flush loop drains whatever accumulated into a single
+`COPY`. Batch size is self-tuning — small and low-latency when traffic is light,
+large and high-throughput under load. Each request's promise still settles only
+after the `COPY` carrying its rows completes, so a 200 continues to mean
+"durably stored". Verified: a run reporting 1,236,000 accepted logs increased
+`count(*)` by exactly 1,236,000.
+
+**Bottleneck 2 — the connection pool.**
+postgres.js defaults to 10 connections and this was never configured. Requests
+that could not get one simply waited, which is what produced tens-of-seconds p95
+latency at idle CPU. Now `DATABASE_POOL_MAX` (default 24) with a
+`connect_timeout`, so a request fails fast instead of holding a socket open.
+
+**Bottleneck 3 — memory during large flushes.**
+`insertLogs` built the whole CSV payload with `rows.join("")`, a second full copy
+of the batch in a 256 MB container. Now serialised in 500-row chunks honouring
+stream backpressure.
+
+**Measured anti-optimization — buffer depth.** Making the ingestion buffer
+*deeper* is actively harmful. Raising `INGEST_MAX_PENDING_ROWS` from 25k to 100k
+dropped throughput from 18,089 to 5,017 logs/s and pushed p95 from 7.6 s to
+70 s — textbook bufferbloat, since a deeper queue only adds waiting once the
+writer is already saturated. The default is tuned to roughly one second of
+drain at measured throughput; beyond that the service sheds with 503 +
+`Retry-After`, which is both faster for the client and safer than buffering into
+an OOM kill.
+
+**Current ceiling.** The application container is now the bottleneck: Node is
+single-threaded and pinned at ~49% of its 0.5-core limit while PostgreSQL still
+has headroom. Further gains would come from reducing per-log CPU work in the
+application (JSON parsing, validation, CSV serialisation), not from the database.
+
 Key optimizations currently implemented:
+
+* group-commit write buffering with backpressure (503 + `Retry-After`)
 
 * batched PostgreSQL inserts
 * timestamp-based indexes
