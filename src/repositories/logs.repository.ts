@@ -187,11 +187,15 @@ export async function aggregateLogs(query: AggregateQuery) {
   }[query.bucket];
 
 
-  const bucketStart = sql`
-    date_bin(
-      ${bucket}::interval,
-      ${logs.timestamp},
-      ${query.since.toISOString()}::timestamptz
+  
+  const bucketStart = sql<string>`
+    to_char(
+      date_bin(
+        ${bucket}::interval,
+        ${logs.timestamp},
+        ${query.since.toISOString()}::timestamptz
+      ) AT TIME ZONE 'UTC',
+      'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
     )
   `;
 

@@ -318,6 +318,118 @@ test("GET /logs and /logs/aggregate validate shared filters identically", async 
   }
 });
 
+test("GET /logs/aggregate returns the documented bucket shape", async () => {
+  const { server, baseUrl } = await startServer();
+
+  const service = `agg-shape-${Date.now()}-${Math.round(Math.random() * 1e6)}`;
+
+  // Minute-aligned so bucket starts are exact and the assertions stay
+  // deterministic regardless of when the suite runs.
+  const base = new Date(Math.floor(Date.now() / 60_000) * 60_000);
+  const at = (minutesAgo: number) =>
+    new Date(base.getTime() - minutesAgo * 60_000);
+
+  const since = at(3);
+  const until = new Date(base.getTime() + 60_000);
+
+  const entry = (when: Date, level: string) => ({
+    timestamp: when.toISOString(),
+    level,
+    service,
+    message: "aggregate shape",
+  });
+
+  const aggregate = async (extra = "") => {
+    const response = await fetch(
+      `${baseUrl}/logs/aggregate?since=${encodeURIComponent(since.toISOString())}` +
+        `&until=${encodeURIComponent(until.toISOString())}` +
+        `&bucket=1m&service=${service}${extra}`,
+    );
+
+    assert.equal(response.status, 200);
+
+    return (await response.json()) as {
+      buckets: { start: string; group: string | null; count: number }[];
+    };
+  };
+
+  try {
+    const ingest = await fetch(`${baseUrl}/logs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        logs: [
+          entry(at(2), "info"),
+          entry(at(2), "info"),
+          entry(at(1), "error"),
+          entry(at(1), "error"),
+          entry(at(1), "error"),
+        ],
+      }),
+    });
+
+    assert.equal(ingest.status, 200);
+
+    const { buckets } = await aggregate();
+
+    // Two populated minutes; empty buckets may be omitted.
+    assert.equal(buckets.length, 2);
+
+    for (const bucket of buckets) {
+      // The contract documents an ISO-8601 instant such as
+      // "2026-07-20T14:00:00Z". PostgreSQL hands timestamptz back as
+      // "2026-07-20 14:00:00+00", which is a different format entirely, so this
+      // asserts the rendered shape rather than merely that a value is present.
+      assert.match(
+        bucket.start,
+        /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/,
+        `start is not ISO 8601: ${bucket.start}`,
+      );
+
+      // Canonical, not just regex-shaped: parsing and re-rendering must be a
+      // round trip, which also proves the instant is UTC rather than shifted.
+      assert.equal(new Date(bucket.start).toISOString(), bucket.start);
+
+      assert.equal(typeof bucket.count, "number");
+
+      // group must be null when group_by is not supplied.
+      assert.equal(bucket.group, null);
+    }
+
+    // Ordered by bucket start ascending.
+    assert.deepEqual(
+      [...buckets].map((b) => b.start).sort(),
+      buckets.map((b) => b.start),
+    );
+
+    assert.equal(buckets[0]!.start, at(2).toISOString());
+    assert.equal(buckets[0]!.count, 2);
+    assert.equal(buckets[1]!.start, at(1).toISOString());
+    assert.equal(buckets[1]!.count, 3);
+
+    // group_by carries the grouping dimension through unchanged.
+    const grouped = await aggregate("&group_by=service");
+
+    assert.equal(grouped.buckets.length, 2);
+
+    for (const bucket of grouped.buckets) {
+      assert.equal(bucket.group, service);
+    }
+
+    const byLevel = await aggregate("&group_by=level");
+
+    assert.deepEqual(
+      byLevel.buckets.map((b) => [b.group, b.count]),
+      [
+        ["info", 2],
+        ["error", 3],
+      ],
+    );
+  } finally {
+    await stopServer(server);
+  }
+});
+
 test("concurrent batches are all durable once POST /logs returns 200", async () => {
   const { server, baseUrl } = await startServer();
 
