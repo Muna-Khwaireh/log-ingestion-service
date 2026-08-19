@@ -31,6 +31,10 @@ const config = {
 const ANCIENT = new Date("2019-05-05T12:34:56.000Z");
 const ARCHAIC = new Date("2011-11-11T11:11:11.000Z");
 
+/** Far enough back that no partition covers it, and distinct from the dates the
+ *  other tests use so they cannot interfere with each other. */
+const BLOCKED = new Date("2015-03-03T08:00:00.000Z");
+
 async function countAt(timestamp: Date) {
   const rows = await getClient()<{ count: string }[]>`
     SELECT count(*)::text AS count FROM logs WHERE "timestamp" = ${timestamp.toISOString()}::timestamptz
@@ -98,7 +102,7 @@ test("ensurePartitions is idempotent, so a routine pass issues no DDL", async ()
     lockTimeoutMs: config.lockTimeoutMs,
   });
 
-  const created = await ensurePartitions({
+  const { created } = await ensurePartitions({
     now,
     retentionDays: config.retentionDays,
     widthMs: config.partitionWidthMs,
@@ -107,6 +111,62 @@ test("ensurePartitions is idempotent, so a routine pass issues no DDL", async ()
   });
 
   assert.deepEqual(created, []);
+});
+
+test("a partition that cannot be created is reported, not silently skipped", async () => {
+  const start = partitionStart(BLOCKED, DAY_MS);
+  const name = partitionName(start);
+
+  try {
+    // No partition covers this timestamp, so the row lands in the default
+    // partition -- which is precisely what then blocks the partition for that
+    // range from being created.
+    await insertLogs([
+      {
+        timestamp: BLOCKED,
+        level: "warn",
+        service: "retention-test",
+        message: "blocks its own partition",
+        attributes: { case: "blocked" },
+      },
+    ]);
+
+    assert.equal(await partitionOf(BLOCKED), "logs_default");
+
+    // PostgreSQL refuses to attach a range the default partition already holds
+    // rows for, so this creation fails. Ingestion keeps working, but those rows
+    // lose partition pruning and can only be reclaimed row by row -- so the
+    // failure has to reach the caller rather than being logged and dropped.
+    const { created, failed } = await ensurePartitions({
+      now: BLOCKED,
+      retentionDays: 0,
+      widthMs: DAY_MS,
+      ahead: 0,
+      lockTimeoutMs: config.lockTimeoutMs,
+    });
+
+    assert.equal(
+      created.includes(name),
+      false,
+      "a partition that failed to create must not be reported as created",
+    );
+
+    assert.deepEqual(
+      failed.map((entry) => entry.name),
+      [name],
+    );
+
+    assert.ok(
+      failed[0]?.error,
+      "the reported failure must carry the underlying error",
+    );
+  } finally {
+    await getClient()`
+      DELETE FROM logs_default WHERE "timestamp" = ${BLOCKED.toISOString()}::timestamptz
+    `;
+
+    await getClient().unsafe(`DROP TABLE IF EXISTS ${name}`);
+  }
 });
 
 test("expired logs are removed by dropping their partition, not by deleting rows", async () => {

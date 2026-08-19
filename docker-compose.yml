@@ -6,6 +6,11 @@ services:
     ports:
       - "8080:8080"
     environment:
+      # Set at runtime rather than in the Dockerfile: drizzle-kit is a
+      # devDependency but runs at startup for migrations, so NODE_ENV must not
+      # be production while `npm ci` installs, or the build and the migration
+      # step would both lose the packages they need.
+      NODE_ENV: production
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/logs
       RETENTION_DAYS: 30
       RETENTION_INTERVAL_MS: 3600000

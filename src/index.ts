@@ -59,6 +59,19 @@ async function runRetentionPass() {
       );
     }
 
+    if (result.failedPartitions.length > 0) {
+      // Loud on purpose. Ingestion keeps working -- these rows land in the
+      // default partition -- but they lose partition pruning on reads and can
+      // only be reclaimed by a row-by-row delete instead of a partition drop.
+      // Silent degradation here is what makes it hard to diagnose later.
+      console.error(
+        `Retention could not create ${result.failedPartitions.length} partition(s): ` +
+          `${result.failedPartitions.map((entry) => entry.name).join(", ")}. ` +
+          `Logs in those ranges will be stored in the default partition, ` +
+          `which is slower to query and slower to reclaim.`,
+      );
+    }
+
     if (result.droppedPartitions.length > 0) {
       console.log(
         `Retention dropped expired partitions: ${result.droppedPartitions.join(", ")}`,
@@ -101,14 +114,14 @@ server.listen(PORT, "0.0.0.0", () => {
 
 let shuttingDown = false;
 
-async function shutdown(signal: NodeJS.Signals) {
+async function shutdown(reason: string, exitCode = 0) {
   if (shuttingDown) {
     return;
   }
 
   shuttingDown = true;
 
-  console.log(`Received ${signal}, shutting down gracefully`);
+  console.log(`${reason}, shutting down gracefully`);
 
   
   const forceExit = setTimeout(() => {
@@ -142,12 +155,35 @@ async function shutdown(signal: NodeJS.Signals) {
 
     clearTimeout(forceExit);
     console.log("Shutdown complete");
-    process.exit(0);
+    process.exit(exitCode);
   } catch (error) {
     console.error("Error during shutdown:", error);
     process.exit(1);
   }
 }
 
-process.on("SIGTERM", () => void shutdown("SIGTERM"));
-process.on("SIGINT", () => void shutdown("SIGINT"));
+process.on("SIGTERM", () => void shutdown("Received SIGTERM"));
+process.on("SIGINT", () => void shutdown("Received SIGINT"));
+
+/**
+ * A crash must not leave the process half-alive: still holding the port and the
+ * connection pool while no longer serving requests. Node's default is to print
+ * the error and exit immediately, which would abandon rows already accepted into
+ * the ingestion buffer and leave the pool to time out server-side.
+ *
+ * These handlers instead run the same drain as a signal shutdown, then exit
+ * non-zero so the failure is visible in container logs and exit status rather
+ * than looking like a clean stop. Resuming normal operation is deliberately not
+ * attempted: after an uncaught exception the process state is undefined, so the
+ * only safe move is to finish outstanding work and let the restart policy bring
+ * up a fresh instance. The force-exit timer in shutdown() bounds that attempt.
+ */
+process.on("uncaughtException", (error) => {
+  console.error("Uncaught exception:", error);
+  void shutdown("Uncaught exception", 1);
+});
+
+process.on("unhandledRejection", (reason) => {
+  console.error("Unhandled promise rejection:", reason);
+  void shutdown("Unhandled promise rejection", 1);
+});

@@ -17,6 +17,9 @@ export type RetentionConfig = {
 export type RetentionResult = {
   cutoff: Date;
   createdPartitions: string[];
+  /** Partitions that could not be created; rows for those ranges fall into the
+   *  default partition and lose partition pruning until it succeeds. */
+  failedPartitions: { name: string; error: unknown }[];
   droppedPartitions: string[];
   deletedFromDefault: number;
 };
@@ -63,13 +66,14 @@ export async function runRetention(
 ): Promise<RetentionResult> {
   const cutoff = retentionCutoff(config.retentionDays, now);
 
-  const createdPartitions = await ensurePartitions({
-    now,
-    retentionDays: config.retentionDays,
-    widthMs: config.partitionWidthMs,
-    ahead: config.partitionsAhead,
-    lockTimeoutMs: config.lockTimeoutMs,
-  });
+  const { created: createdPartitions, failed: failedPartitions } =
+    await ensurePartitions({
+      now,
+      retentionDays: config.retentionDays,
+      widthMs: config.partitionWidthMs,
+      ahead: config.partitionsAhead,
+      lockTimeoutMs: config.lockTimeoutMs,
+    });
 
   const droppedPartitions = await dropExpiredPartitions({
     cutoff,
@@ -84,6 +88,7 @@ export async function runRetention(
   return {
     cutoff,
     createdPartitions,
+    failedPartitions,
     droppedPartitions,
     deletedFromDefault,
   };

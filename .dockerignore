@@ -1,0 +1,23 @@
+# Build context exclusions. The Dockerfile copies specific paths rather than
+# "COPY . .", so this mainly keeps the context small and makes sure host-built
+# artefacts can never shadow what the image builds itself.
+
+node_modules
+dist
+
+.git
+.gitignore
+.gitattributes
+.github
+
+# Local environment and editor state
+.env
+.env.*
+!.env.example
+.vscode
+.idea
+
+# Docs and scratch files that do not belong in an image layer
+README.md
+scripts
+*.log

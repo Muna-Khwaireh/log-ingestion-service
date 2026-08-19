@@ -136,11 +136,24 @@ export async function listPartitions(): Promise<PartitionInfo[]> {
   }));
 }
 
+export type EnsurePartitionsResult = {
+  created: string[];
+  /** Partitions that could not be created, with the error that prevented it. */
+  failed: { name: string; error: unknown }[];
+};
+
 /**
  * Creates any partition missing from the retention window. Existing partitions
  * are looked up first so a routine pass issues no DDL at all -- otherwise every
  * run would take an ACCESS EXCLUSIVE lock on "logs" once per partition just to
  * discover there was nothing to do.
+ *
+ * Failures are returned rather than only logged. A partition that cannot be
+ * created is not fatal -- rows for that range land in the default partition and
+ * stay queryable -- but it is a real degradation: those rows lose partition
+ * pruning and can only be reclaimed by a row-by-row delete instead of a partition
+ * drop. Reporting it lets the caller say so plainly instead of leaving the
+ * service quietly slower with the reason buried in a log line.
  */
 export async function ensurePartitions(options: {
   now: Date;
@@ -148,7 +161,7 @@ export async function ensurePartitions(options: {
   widthMs: number;
   ahead: number;
   lockTimeoutMs: number;
-}) {
+}): Promise<EnsurePartitionsResult> {
   const starts = requiredPartitionStarts(options);
 
   const existing = new Set(
@@ -156,6 +169,7 @@ export async function ensurePartitions(options: {
   );
 
   const created: string[] = [];
+  const failed: EnsurePartitionsResult["failed"] = [];
 
   for (const start of starts) {
     const name = partitionName(start);
@@ -186,14 +200,12 @@ export async function ensurePartitions(options: {
 
       created.push(name);
     } catch (error) {
-      // A partition that cannot be created is not fatal: rows for that range
-      // fall into the default partition, stay queryable, and are still removed
-      // by the cutoff sweep.
       console.error(`Retention: could not create partition ${name}:`, error);
+      failed.push({ name, error });
     }
   }
 
-  return created;
+  return { created, failed };
 }
 
 /**

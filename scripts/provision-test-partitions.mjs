@@ -6,7 +6,7 @@ import { closeDb } from "../dist/db/index.js";
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 try {
-  const created = await ensurePartitions({
+  const { created, failed } = await ensurePartitions({
     now: new Date(),
     // A small window around now -- enough to cover today (and the day either
     // side, for a run that straddles UTC midnight). The tests provision the
@@ -22,6 +22,17 @@ try {
       ? `Provisioned test partitions: ${created.join(", ")}`
       : "Test partitions already present",
   );
+
+  // Fail loudly: if today's partition could not be created the suite would run
+  // against a database where now-dated rows land in the default partition,
+  // which is the exact condition this script exists to prevent.
+  if (failed.length > 0) {
+    console.error(
+      `Failed to provision: ${failed.map((entry) => entry.name).join(", ")}`,
+    );
+
+    process.exitCode = 1;
+  }
 } finally {
   await closeDb();
 }
