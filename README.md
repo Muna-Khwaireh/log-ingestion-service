@@ -586,6 +586,16 @@ docker compose up
 
 without requiring manual database setup.
 
+### Graceful shutdown
+
+On `SIGTERM` (sent by `docker compose down` / `docker stop`) or `SIGINT`
+(Ctrl+C), the service shuts down cleanly instead of dropping work in flight: it
+stops scheduling retention, stops accepting new connections and lets in-flight
+requests finish, waits for any running retention pass, then closes the database
+connection pool and exits `0`. If draining does not complete within
+`SHUTDOWN_TIMEOUT_MS` (default `10000`), it forces the exit so the container
+still stops promptly.
+
 ### PostgreSQL configuration
 
 Both services declare `deploy.resources.limits` in `docker-compose.yml` (the app

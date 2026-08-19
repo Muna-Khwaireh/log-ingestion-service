@@ -1,4 +1,5 @@
 import { createApp } from "./app.js";
+import { closeDb } from "./db/index.js";
 import {
   runRetention,
   type RetentionConfig,
@@ -30,6 +31,8 @@ const retentionIntervalMs = numberFromEnv(
   "RETENTION_INTERVAL_MS",
   60 * 60 * 1000,
 );
+
+const shutdownTimeoutMs = numberFromEnv("SHUTDOWN_TIMEOUT_MS", 10_000);
 
 const retentionConfig: RetentionConfig = {
   retentionDays: numberFromEnv("RETENTION_DAYS", 30),
@@ -72,14 +75,73 @@ async function runRetentionPass() {
 }
 
 
-await runRetentionPass();
+
+let activeRetention: Promise<void> = Promise.resolve();
+
+function triggerRetention() {
+  activeRetention = runRetentionPass();
+  return activeRetention;
+}
+
+await triggerRetention();
 
 const server = createApp();
+
+let retentionTimer: ReturnType<typeof setInterval> | undefined;
 
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`Server is running on port ${PORT}`);
 
-  setInterval(() => {
-    void runRetentionPass();
+  retentionTimer = setInterval(() => {
+    void triggerRetention();
   }, retentionIntervalMs);
 });
+
+
+let shuttingDown = false;
+
+async function shutdown(signal: NodeJS.Signals) {
+  if (shuttingDown) {
+    return;
+  }
+
+  shuttingDown = true;
+
+  console.log(`Received ${signal}, shutting down gracefully`);
+
+  
+  const forceExit = setTimeout(() => {
+    console.error(
+      `Shutdown did not complete within ${shutdownTimeoutMs}ms, forcing exit`,
+    );
+    process.exit(1);
+  }, shutdownTimeoutMs);
+  forceExit.unref();
+
+  if (retentionTimer) {
+    clearInterval(retentionTimer);
+  }
+
+  try {
+   
+    await new Promise<void>((resolve) => {
+      server.close(() => resolve());
+      server.closeIdleConnections();
+    });
+
+   
+    await activeRetention;
+
+    await closeDb();
+
+    clearTimeout(forceExit);
+    console.log("Shutdown complete");
+    process.exit(0);
+  } catch (error) {
+    console.error("Error during shutdown:", error);
+    process.exit(1);
+  }
+}
+
+process.on("SIGTERM", () => void shutdown("SIGTERM"));
+process.on("SIGINT", () => void shutdown("SIGINT"));
