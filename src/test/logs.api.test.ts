@@ -286,6 +286,38 @@ test("GET /logs treats LIKE metacharacters in q as literal text", async () => {
   }
 });
 
+test("GET /logs and /logs/aggregate validate shared filters identically", async () => {
+  const { server, baseUrl } = await startServer();
+
+  const since = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+  const until = new Date().toISOString();
+
+  
+  const cases = [
+    { query: "level=nope", error: "invalid level: 'nope'" },
+    { query: "attr.=x", error: "attribute name cannot be empty" },
+  ];
+
+  try {
+    for (const { query, error } of cases) {
+      const get = await fetch(`${baseUrl}/logs?${query}`);
+      const aggregate = await fetch(
+        `${baseUrl}/logs/aggregate?since=${encodeURIComponent(
+          since,
+        )}&until=${encodeURIComponent(until)}&bucket=1h&${query}`,
+      );
+
+      assert.equal(get.status, 400, `GET /logs?${query}`);
+      assert.deepEqual(await get.json(), { error });
+
+      assert.equal(aggregate.status, 400, `GET /logs/aggregate ...&${query}`);
+      assert.deepEqual(await aggregate.json(), { error });
+    }
+  } finally {
+    await stopServer(server);
+  }
+});
+
 test("POST /logs rejects malformed JSON as a client error", async () => {
   const { server, baseUrl } = await startServer();
 

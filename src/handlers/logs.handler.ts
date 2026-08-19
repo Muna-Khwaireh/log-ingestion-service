@@ -2,6 +2,8 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { ingestLogs, queryLogs } from "../services/logs.service.js";
 import type { IngestResult } from "../services/logs.service.js";
 import type {
+  AggregateBucket,
+  AggregateQuery,
   LogLevel,
   LogQuery,
 } from "../logs/log.types.js";
@@ -9,89 +11,110 @@ import { LOG_LEVELS } from "../logs/log.types.js";
 import { decodeCursor } from "../logs/log.cursor.js";
 import { aggregateLogs } from "../repositories/logs.repository.js";
 
+/** The query parameters shared by GET /logs and GET /logs/aggregate. */
+type CommonFilters = Pick<
+  LogQuery,
+  "service" | "level" | "attributeFilters" | "messageQuery"
+>;
+
+type CommonFilterResult =
+  | { ok: true; filters: CommonFilters }
+  | { ok: false; error: string };
+
+
+function badRequest(res: ServerResponse, error: string) {
+  res.writeHead(400, {
+    "Content-Type": "application/json",
+  });
+
+  res.end(JSON.stringify({ error }));
+}
+
+/**
+ * Parses and validates the filters shared by GET /logs and GET /logs/aggregate:
+ * service, level, message search (q) and attribute filters (attr.*). Both
+ * endpoints route through this one function, so they accept the same inputs and
+ * reject bad ones with the same messages by construction -- rather than by two
+ * hand-written copies happening to stay in agreement.
+ */
+function parseCommonFilters(url: URL): CommonFilterResult {
+  const filters: CommonFilters = {};
+
+  const service = url.searchParams.get("service");
+
+  if (service !== null) {
+    filters.service = service;
+  }
+
+  const levelParam = url.searchParams.get("level");
+
+  if (levelParam !== null) {
+    if (!LOG_LEVELS.includes(levelParam as LogLevel)) {
+      return { ok: false, error: `invalid level: '${levelParam}'` };
+    }
+
+    filters.level = levelParam as LogLevel;
+  }
+
+  const attributeFilters: Record<string, string> = {};
+
+  for (const [key, value] of url.searchParams.entries()) {
+    if (key.startsWith("attr.")) {
+      const attributeName = key.slice(5);
+
+      if (!attributeName) {
+        return { ok: false, error: "attribute name cannot be empty" };
+      }
+
+      attributeFilters[attributeName] = value;
+    }
+  }
+
+  if (Object.keys(attributeFilters).length > 0) {
+    filters.attributeFilters = attributeFilters;
+  }
+
+  const q = url.searchParams.get("q");
+
+  if (q !== null) {
+    filters.messageQuery = q;
+  }
+
+  return { ok: true, filters };
+}
+
 export async function handleGetLogs(
   req: IncomingMessage,
   res: ServerResponse,
 ) {
   try {
-    const url = new URL(
-      req.url ?? "/logs",
-      "http://localhost",
-    );
+    const url = new URL(req.url ?? "/logs", "http://localhost");
 
-    const service = url.searchParams.get("service") ?? undefined;
+    const common = parseCommonFilters(url);
 
-    const levelParam = url.searchParams.get("level");
-    let level: LogLevel | undefined;
-
-    if (levelParam !== null) {
-      if (!LOG_LEVELS.includes(levelParam as LogLevel)) {
-        res.writeHead(400, {
-          "Content-Type": "application/json",
-        });
-
-        res.end(
-          JSON.stringify({
-            error: `invalid level: '${levelParam}'`,
-          }),
-        );
-
-        return;
-      }
-
-      level = levelParam as LogLevel;
+    if (!common.ok) {
+      badRequest(res, common.error);
+      return;
     }
 
     const sinceParam = url.searchParams.get("since");
     const untilParam = url.searchParams.get("until");
 
-    const since = sinceParam
-      ? new Date(sinceParam)
-      : undefined;
-
-    const until = untilParam
-      ? new Date(untilParam)
-      : undefined;
+    const since = sinceParam ? new Date(sinceParam) : undefined;
+    const until = untilParam ? new Date(untilParam) : undefined;
 
     if (sinceParam && Number.isNaN(since!.getTime())) {
-      res.writeHead(400, {
-        "Content-Type": "application/json",
-      });
-
-      res.end(
-        JSON.stringify({
-          error: "invalid since timestamp",
-        }),
-      );
-
+      badRequest(res, "invalid since timestamp");
       return;
     }
 
     if (untilParam && Number.isNaN(until!.getTime())) {
-      res.writeHead(400, {
-        "Content-Type": "application/json",
-      });
-
-      res.end(
-        JSON.stringify({
-          error: "invalid until timestamp",
-        }),
-      );
-
+      badRequest(res, "invalid until timestamp");
       return;
     }
 
     if (since && until && until < since) {
-      res.writeHead(400, {
-        "Content-Type": "application/json",
-      });
-
-      res.end(
-        JSON.stringify({
-          error: "until must not be earlier than since",
-        }),
-      );
-
+      badRequest(res, "until must not be earlier than since");
       return;
     }
 
@@ -102,21 +125,8 @@ export async function handleGetLogs(
     if (limitParam !== null) {
       limit = Number(limitParam);
 
-      if (
-        !Number.isInteger(limit) ||
-        limit < 1 ||
-        limit > 1000
-      ) {
-        res.writeHead(400, {
-          "Content-Type": "application/json",
-        });
-
-        res.end(
-          JSON.stringify({
-            error: "limit must be an integer between 1 and 1000",
-          }),
-        );
-
+      if (!Number.isInteger(limit) || limit < 1 || limit > 1000) {
+        badRequest(res, "limit must be an integer between 1 and 1000");
         return;
       }
     }
@@ -134,77 +144,27 @@ export async function handleGetLogs(
           id: decoded.id,
         };
       } catch {
-        res.writeHead(400, {
-          "Content-Type": "application/json",
-        });
-
-        res.end(
-          JSON.stringify({
-            error: "invalid cursor",
-          }),
-        );
-
+        badRequest(res, "invalid cursor");
         return;
       }
     }
 
-    const attributeFilters: Record<string, string> = {};
+    const query: LogQuery = {
+      ...common.filters,
+      limit,
+    };
 
-    for (const [key, value] of url.searchParams.entries()) {
-      if (key.startsWith("attr.")) {
-        const attributeName = key.slice(5);
-
-        if (!attributeName) {
-          res.writeHead(400, {
-            "Content-Type": "application/json",
-          });
-
-          res.end(
-            JSON.stringify({
-              error: "attribute name cannot be empty",
-            }),
-          );
-
-          return;
-        }
-
-        attributeFilters[attributeName] = value;
-      }
+    if (since !== undefined) {
+      query.since = since;
     }
 
-    const q = url.searchParams.get("q") ?? undefined;
+    if (until !== undefined) {
+      query.until = until;
+    }
 
-    const query: LogQuery = {
-  limit,
-};
-
-if (service !== undefined) {
-  query.service = service;
-}
-
-if (level !== undefined) {
-  query.level = level;
-}
-
-if (since !== undefined) {
-  query.since = since;
-}
-
-if (until !== undefined) {
-  query.until = until;
-}
-
-if (Object.keys(attributeFilters).length > 0) {
-  query.attributeFilters = attributeFilters;
-}
-
-if (q !== undefined) {
-  query.messageQuery = q;
-}
-
-if (cursor !== undefined) {
-  query.cursor = cursor;
-}
+    if (cursor !== undefined) {
+      query.cursor = cursor;
+    }
 
     const result = await queryLogs(query);
 
@@ -400,158 +360,66 @@ export async function handleAggregateLogs(
     );
 
     const sinceParam = url.searchParams.get("since");
-const untilParam = url.searchParams.get("until");
-const bucketParam = url.searchParams.get("bucket");
-const groupByParam = url.searchParams.get("group_by");
+    const untilParam = url.searchParams.get("until");
+    const bucketParam = url.searchParams.get("bucket");
+    const groupByParam = url.searchParams.get("group_by");
 
-if (!sinceParam || !untilParam || !bucketParam) {
-  res.writeHead(400, {
-    "Content-Type": "application/json",
-  });
-
-  res.end(
-    JSON.stringify({
-      error: "since, until, and bucket are required",
-    }),
-  );
-
-  return;
-}
-
-const since = new Date(sinceParam);
-const until = new Date(untilParam);
-
-if (
-  Number.isNaN(since.getTime()) ||
-  Number.isNaN(until.getTime())
-) {
-  res.writeHead(400, {
-    "Content-Type": "application/json",
-  });
-
-  res.end(
-    JSON.stringify({
-      error: "invalid timestamp",
-    }),
-  );
-
-  return;
-}
-
-if (until <= since) {
-  res.writeHead(400, {
-    "Content-Type": "application/json",
-  });
-
-  res.end(
-    JSON.stringify({
-      error: "until must be later than since",
-    }),
-  );
-
-  return;
-}
-
-if (
-  bucketParam !== "1m" &&
-  bucketParam !== "5m" &&
-  bucketParam !== "1h" &&
-  bucketParam !== "1d"
-) {
-  res.writeHead(400, {
-    "Content-Type": "application/json",
-  });
-
-  res.end(
-    JSON.stringify({
-      error: "invalid bucket",
-    }),
-  );
-
-  return;
-}
-
-if (
-  groupByParam !== null &&
-  groupByParam !== "service" &&
-  groupByParam !== "level"
-) {
-  res.writeHead(400, {
-    "Content-Type": "application/json",
-  });
-
-  res.end(
-    JSON.stringify({
-      error: "invalid groupBy",
-    }),
-  );
-
-  return;
-}
-
-const service = url.searchParams.get("service") ?? undefined;
-
-const levelParam = url.searchParams.get("level");
-let level: LogLevel | undefined;
-
-if (levelParam !== null) {
-  if (!LOG_LEVELS.includes(levelParam as LogLevel)) {
-    res.writeHead(400, {
-      "Content-Type": "application/json",
-    });
-
-    res.end(
-      JSON.stringify({
-        error: `invalid level: '${levelParam}'`,
-      }),
-    );
-
-    return;
-  }
-
-  level = levelParam as LogLevel;
-}
-
-const q = url.searchParams.get("q") ?? undefined;
-
-const attributeFilters: Record<string, string> = {};
-
-for (const [key, value] of url.searchParams.entries()) {
-  if (key.startsWith("attr.")) {
-    const attributeName = key.slice(5);
-
-    if (!attributeName) {
-      res.writeHead(400, {
-        "Content-Type": "application/json",
-      });
-
-      res.end(
-        JSON.stringify({
-          error: "attribute name cannot be empty",
-        }),
-      );
-
+    if (!sinceParam || !untilParam || !bucketParam) {
+      badRequest(res, "since, until, and bucket are required");
       return;
     }
 
-    attributeFilters[attributeName] = value;
-  }
-}
+    const since = new Date(sinceParam);
+    const until = new Date(untilParam);
 
-    const result = await aggregateLogs({
-  since,
-  until,
-  bucket: bucketParam as "1m" | "5m" | "1h" | "1d",
-  ...(groupByParam === "service" || groupByParam === "level"
-    ? { groupBy: groupByParam }
-    : {}),
-  ...(service !== undefined ? { service } : {}),
-  ...(level !== undefined ? { level } : {}),
-  ...(Object.keys(attributeFilters).length > 0
-    ? { attributeFilters }
-    : {}),
-  ...(q !== undefined ? { messageQuery: q } : {}),
-});
+    if (Number.isNaN(since.getTime()) || Number.isNaN(until.getTime())) {
+      badRequest(res, "invalid timestamp");
+      return;
+    }
+
+    if (until <= since) {
+      badRequest(res, "until must be later than since");
+      return;
+    }
+
+    if (
+      bucketParam !== "1m" &&
+      bucketParam !== "5m" &&
+      bucketParam !== "1h" &&
+      bucketParam !== "1d"
+    ) {
+      badRequest(res, "invalid bucket");
+      return;
+    }
+
+    if (
+      groupByParam !== null &&
+      groupByParam !== "service" &&
+      groupByParam !== "level"
+    ) {
+      badRequest(res, "invalid groupBy");
+      return;
+    }
+
+    const common = parseCommonFilters(url);
+
+    if (!common.ok) {
+      badRequest(res, common.error);
+      return;
+    }
+
+    const query: AggregateQuery = {
+      ...common.filters,
+      since,
+      until,
+      bucket: bucketParam as AggregateBucket,
+    };
+
+    if (groupByParam === "service" || groupByParam === "level") {
+      query.groupBy = groupByParam;
+    }
+
+    const result = await aggregateLogs(query);
 
     res.writeHead(200, {
       "Content-Type": "application/json",
