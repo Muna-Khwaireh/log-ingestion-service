@@ -252,7 +252,7 @@ Example response:
 {
   "buckets": [
     {
-      "start": "2026-08-17 18:59:00+00",
+      "start": "2026-08-17T18:59:00.000Z",
       "group": null,
       "count": 1
     }
@@ -260,7 +260,53 @@ Example response:
 }
 ```
 
-Aggregation uses PostgreSQL `date_bin` to assign logs to time buckets.
+`start` is always rendered as an explicit UTC ISO-8601 instant. PostgreSQL
+returns `timestamptz` in its own text format (`2026-08-17 18:59:00+00`), which
+is not ISO 8601, so the value is formatted server-side instead of being passed
+through as the driver returns it.
+
+#### Bucket alignment
+
+Aggregation uses PostgreSQL `date_bin` to assign logs to time buckets, with
+**`since` as the origin**. Buckets are therefore aligned relative to the `since`
+timestamp rather than to fixed calendar boundaries: every bucket starts at
+`since + k x bucket`.
+
+With an unaligned `since`, the offset is preserved:
+
+```bash
+curl "http://localhost:8080/logs/aggregate?since=2026-08-19T12:58:23Z&until=2026-08-19T13:02:19Z&bucket=1m"
+```
+
+```json
+{
+  "buckets": [
+    { "start": "2026-08-19T12:58:23.000Z", "group": null, "count": 2 },
+    { "start": "2026-08-19T12:59:23.000Z", "group": null, "count": 3 },
+    { "start": "2026-08-19T13:00:23.000Z", "group": null, "count": 316 }
+  ]
+}
+```
+
+**Why since-origin.** The specification defines `bucket` as a *size* ("Bucket
+size: `1m`, `5m`, `1h`, or `1d`") and `since` as "the inclusive start of the
+aggregation range", but never states an alignment rule. Its worked example uses
+a `since` that is already calendar-aligned (`14:00:00Z`), so that example cannot
+distinguish the two readings — both produce identical output whenever `since`
+falls on a bucket boundary.
+
+Aligning to `since` was chosen because it keeps every bucket inside the
+requested range. Under calendar alignment, `since=14:30Z` with `bucket=1h` would
+emit a bucket labelled `14:00:00Z` — a start *earlier* than the inclusive start
+of the range, reporting a count for a period only half of which was asked for.
+With `since` as the origin, every `start` satisfies `start >= since` and each
+bucket's span lies entirely within `[since, until)`.
+
+**Trade-off.** Bucket boundaries move when `since` moves, so two queries with
+different `since` values are not comparable bucket-for-bucket. Calendar-aligned
+buckets would be stable across queries at the cost of the partial leading bucket
+described above; that alternative is a one-line change to the `date_bin` origin
+in `aggregateLogs`.
 
 ## Database Schema
 
@@ -415,37 +461,52 @@ Two indexes were removed in `0003_trim_write_heavy_indexes`:
   Filtering by level through `idx_logs_timestamp_id` measured 0.119 ms against
   0.087 ms with the dedicated index, which does not justify its write cost.
 
+Both measurements above predate `0004_partition_logs_by_time`, which replaced
+the standalone `idx_logs_timestamp_id` with the `(timestamp, id)` primary key.
+`logs_pkey` serves the same access path, so the conclusions still hold — the
+index named in those measurements is simply called `logs_pkey` today.
+
 ## Query Performance
 
-The primary aggregation query was inspected using PostgreSQL:
+The primary aggregation query, measured on a 4.7M-row table under the graded
+container limits:
 
 ```sql
-EXPLAIN (ANALYZE, BUFFERS)
+EXPLAIN (ANALYZE, BUFFERS, TIMING OFF, COSTS OFF)
+SELECT date_bin('1 minute'::interval, timestamp, TIMESTAMPTZ '2026-08-19 12:55:00+00') AS s,
+       service, count(*)::int
+FROM logs
+WHERE timestamp >= TIMESTAMPTZ '2026-08-19 12:55:00+00'
+  AND timestamp <  TIMESTAMPTZ '2026-08-19 13:05:00+00'
+GROUP BY 1, service
+ORDER BY 1;
 ```
-
-The timestamp index was used for the time-range condition:
 
 ```text
-Bitmap Index Scan on idx_logs_timestamp_id
+ GroupAggregate (actual rows=12 loops=1)
+   ->  Sort (actual rows=637 loops=1)
+         Sort Method: quicksort  Memory: 64kB
+         ->  Index Scan using logs_p20260819t00_pkey on logs_p20260819t00 logs (actual rows=637 loops=1)
+               Index Cond: (("timestamp" >= '2026-08-19 12:55:00+00') AND ("timestamp" < '2026-08-19 13:05:00+00'))
+               Buffers: shared hit=19
+ Execution Time: 0.519 ms
 ```
 
-The local aggregation query completed in approximately 1 ms on the development dataset.
+Two things to note:
 
-The query plan included:
+* Only one partition is touched. The other 33 are eliminated before execution;
+  with parameterised bounds the same pruning appears explicitly as
+  `Subplans Removed: 33`.
+* The range condition is served by `logs_pkey` — the `(timestamp, id)` primary
+  key — so no separate timestamp index is maintained on writes.
 
-```text
-Bitmap Index Scan
-Bitmap Heap Scan
-Sort
-GroupAggregate
-```
+Execution time is **0.519 ms** for a ten-minute window over a 4.7M-row table.
 
-The local dataset was intentionally small, so this measurement is not representative of the final one-million-row benchmark.
-
-Measured results against a 3.6M-row dataset under the graded container limits
-are in [Performance Benchmark](#performance-benchmark). Partition pruning is
-confirmed there by `EXPLAIN`, which reports `Subplans Removed: 33` — only the
-partition covering the requested range is scanned.
+Cost scales with the number of rows in the requested range, not with table size.
+A window that covers most of a partition is planned as a parallel sequential
+scan over that partition instead, which is the correct choice when the predicate
+matches nearly every row. End-to-end aggregate latency measured under concurrent
+ingestion is reported in [Performance Benchmark](#performance-benchmark).
 
 ## Retention
 
@@ -589,6 +650,14 @@ docker compose up
 
 without requiring manual database setup.
 
+### Restart policy
+
+Both containers declare `restart: unless-stopped`. A crash — an OOM kill, an
+unhandled error — must not take the service out for the remainder of a run.
+Without it a container that exits stays down and every subsequent request fails
+with a connection error, which is exactly what happened during an early load
+test: the application container died mid-run and never came back.
+
 ### Graceful shutdown
 
 On `SIGTERM` (sent by `docker compose down` / `docker stop`) or `SIGINT`
@@ -638,7 +707,18 @@ must point at a reachable database:
 DATABASE_URL=postgresql://postgres:postgres@localhost:5433/logs npm test
 ```
 
-`npm test` builds first, so a type error also fails the run.
+`npm test` builds first, so a type error also fails the run. It then runs
+`scripts/provision-test-partitions.mjs`, which creates the current time
+partitions before the suite starts. A freshly migrated database has the
+partitioned table but no time partitions — those are created at runtime by the
+retention job — so without this step the integration tests would write
+now-dated rows into the default partition, which then blocks the retention
+tests from creating today's partition. Provisioning up front mirrors what the
+service does at startup and keeps the suite independent of run order.
+
+The graceful-shutdown test is skipped on Windows, where POSIX signals are
+emulated and `SIGTERM` terminates a child process without running its handler.
+It executes normally on Linux and in CI.
 
 ### Smoke test
 
@@ -1021,7 +1101,7 @@ the only required one, and `docker-compose.yml` already sets it.
 ```text
 src/
 ├── db/
-│   ├── index.ts
+│   ├── index.ts                   # connection pool and lifecycle
 │   └── schema.ts
 ├── handlers/
 │   ├── health.handler.ts
@@ -1030,6 +1110,7 @@ src/
 │   ├── log.cursor.ts
 │   └── log.types.ts
 ├── repositories/
+│   ├── health.repository.ts
 │   └── logs.repository.ts
 ├── retention/
 │   ├── partitions.ts
@@ -1039,10 +1120,26 @@ src/
 │   ├── index.ts
 │   └── logs.routes.ts
 ├── services/
+│   ├── health.service.ts
+│   ├── ingest.buffer.ts           # group-commit write buffer
 │   └── logs.service.ts
+├── test/
+│   ├── health.test.ts
+│   ├── log.cursor.test.ts
+│   ├── logs.api.test.ts
+│   ├── logs.validation.test.ts
+│   ├── retention.test.ts
+│   └── shutdown.test.ts
 ├── validation/
 │   └── logs.validation.ts
-└── index.ts
+├── app.ts                         # HTTP server and route dispatch
+└── index.ts                       # entry point, retention loop, shutdown
+
+scripts/
+├── bench.mjs                      # ingestion + concurrent query benchmark
+├── load-test.mjs                  # simple fixed-volume load script
+├── provision-test-partitions.mjs  # test setup: create current partitions
+└── smoke-test.mjs                 # required-endpoint smoke test
 ```
 
 ## Security
