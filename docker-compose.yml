@@ -12,6 +12,11 @@ services:
       # step would both lose the packages they need.
       NODE_ENV: production
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/logs
+      # Ingestion tuning. Both have working defaults in code, so a plain
+      # `docker compose up` with no environment file still runs the core
+      # service; these are declared here so they can be swept when tuning.
+      INGEST_FLUSH_CONCURRENCY: ${INGEST_FLUSH_CONCURRENCY:-2}
+      INGEST_MAX_PENDING_REQUESTS: ${INGEST_MAX_PENDING_REQUESTS:-500}
       RETENTION_DAYS: 30
       RETENTION_INTERVAL_MS: 3600000
       

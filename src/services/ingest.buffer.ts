@@ -12,22 +12,48 @@ function positiveIntFromEnv(name: string, fallback: number) {
 const MAX_FLUSH_ROWS = positiveIntFromEnv("INGEST_MAX_FLUSH_ROWS", 10_000);
 
 /**
- * Rows allowed to sit unflushed before ingestion sheds load.
- *
- * This is a latency bound as much as a memory guard. Measured drain rate is
- * roughly 39k rows/s, so ~25k rows is well under a second of backlog. Deeper
- * queues were measured to be actively worse: raising this to 100k turned shed
- * requests into 70-second waits and dropped throughput from 18k to 5k logs/s --
- * textbook bufferbloat. Past this point the writer is not keeping up, and 503 +
- * Retry-After is both faster for the client and safer than buffering until the
- * container is OOM-killed.
+ * Rows allowed to sit unflushed before ingestion sheds load. This is the memory
+ * guard: it bounds how much log data can be held in the 256 MB container.
  */
 const MAX_PENDING_ROWS = positiveIntFromEnv("INGEST_MAX_PENDING_ROWS", 25_000);
 
 /**
- * How many flushes may be in flight. PostgreSQL has a single CPU here, so a
- * couple of overlapping COPYs is enough to keep it busy while the next CSV
- * payload is built; more would trade batching for contention.
+ * Requests allowed to sit unflushed before ingestion sheds load. This is the
+ * latency guard, and it is deliberately separate from the row cap.
+ *
+ * A row-only cap silently changes meaning with batch size. Tuned against
+ * 500-row batches, 25k rows is 50 queued requests; against the 10-row batches a
+ * real client sends, the same number is 2,500 queued requests -- and every one
+ * of them waits for all the others to drain. That is what turned a healthy row
+ * budget into a p95 ingestion latency of nearly a minute under load.
+ *
+ * Queue depth in requests is what actually bounds latency, because each request
+ * costs a database round trip regardless of how few rows it carries. Shedding
+ * early is also faster for the client than a long wait: a shed request and a
+ * timed-out request both count as not ingested, but a prompt 503 frees the
+ * connection to try again instead of blocking it.
+ */
+const MAX_PENDING_REQUESTS = positiveIntFromEnv(
+  "INGEST_MAX_PENDING_REQUESTS",
+  500,
+);
+
+/**
+ * How many flushes may be in flight. Each flush is one COPY, so this caps drain
+ * rate at (concurrency / flush latency).
+ *
+ * Two is not a conservative guess -- it measured fastest. Raising it was tried
+ * on the assumption that the database was being starved, and the numbers said
+ * otherwise. Under small-batch load the application container is pinned at its
+ * 0.5 CPU limit while PostgreSQL sits at 17-35%, so the bottleneck is
+ * JavaScript, not the database, and extra concurrent flushes only add
+ * bookkeeping to the thread that is already the constraint:
+ *
+ *   concurrency  2 -> 12,274 logs/s, p95 379 ms
+ *   concurrency  8 -> 11,140 logs/s, p95 400 ms
+ *   concurrency 16 ->  9,052 logs/s, p95 457 ms
+ *
+ * (batch=10, 256 concurrent writers, identical dataset.)
  */
 const FLUSH_CONCURRENCY = positiveIntFromEnv("INGEST_FLUSH_CONCURRENCY", 2);
 
@@ -127,7 +153,10 @@ export function enqueueLogs(rows: NewLog[]): Promise<void> {
     return Promise.resolve();
   }
 
-  if (queuedRows + rows.length > MAX_PENDING_ROWS) {
+  if (
+    queuedRows + rows.length > MAX_PENDING_ROWS ||
+    queue.length >= MAX_PENDING_REQUESTS
+  ) {
     return Promise.reject(new IngestBufferFullError());
   }
 

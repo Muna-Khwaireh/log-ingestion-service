@@ -15,26 +15,59 @@ import type {
 };
 
 
-function csvField(value: string) {
-  return '"' + value.replaceAll('"', '""') + '"';
+/**
+ * Escapes a CSV field's contents. Every field is quoted unconditionally by the
+ * caller, so the only character needing treatment is the quote itself.
+ *
+ * The common case -- a field containing no quote at all -- returns the original
+ * string untouched rather than allocating a replacement. That matters more than
+ * it looks: CPU profiling under small-batch load put the garbage collector at
+ * roughly a quarter of all active CPU, so on this path allocation count is the
+ * cost, not instruction count.
+ */
+function csvEscape(value: string) {
+  return value.indexOf('"') === -1 ? value : value.replaceAll('"', '""');
 }
 
 /** Rows serialised per write, so a large flush never materialises the whole
  *  CSV payload in memory at once. */
 const CSV_CHUNK_ROWS = 500;
 
+/**
+ * A COPY taking longer than this is logged with a per-phase breakdown.
+ *
+ * Under load, individual requests have been observed waiting far longer than
+ * the queue depth can account for, with both containers close to idle -- the
+ * signature of something blocking rather than something working. Timing the
+ * phases separately is what distinguishes a slow commit from a starved
+ * connection pool from socket backpressure.
+ */
+const SLOW_FLUSH_MS = (() => {
+  const value = Number(process.env.INGEST_SLOW_FLUSH_MS);
+  return Number.isInteger(value) && value > 0 ? value : 1_000;
+})();
+
+/**
+ * Builds one CSV record as a single concatenation.
+ *
+ * The quotes and separators are folded into the expression instead of each
+ * field being wrapped by a helper that returns its own string. The previous
+ * shape allocated two intermediate strings per field -- ten per row -- purely
+ * to add quotes that are constant.
+ */
 function csvRow(entry: NewLog) {
   return (
-    csvField(entry.timestamp.toISOString()) +
-    "," +
-    csvField(entry.level) +
-    "," +
-    csvField(entry.service) +
-    "," +
-    csvField(entry.message) +
-    "," +
-    csvField(JSON.stringify(entry.attributes)) +
-    "\n"
+    '"' +
+    csvEscape(entry.timestamp.toISOString()) +
+    '","' +
+    csvEscape(entry.level) +
+    '","' +
+    csvEscape(entry.service) +
+    '","' +
+    csvEscape(entry.message) +
+    '","' +
+    csvEscape(JSON.stringify(entry.attributes)) +
+    '"\n'
   );
 }
 
@@ -56,19 +89,31 @@ export async function insertLogs(entries: NewLog[]) {
     return;
   }
 
+  const startedAt = performance.now();
+
+  // Phase 1 -- acquire. Covers waiting for a pooled connection and for
+  // PostgreSQL to enter COPY mode.
   const stream = await getClient()`
     COPY logs ("timestamp", "level", "service", "message", "attributes")
     FROM STDIN WITH (FORMAT csv)
   `.writable();
 
+  const acquiredAt = performance.now();
+
   let chunk = "";
+  let drainMs = 0;
 
   for (let index = 0; index < entries.length; index += 1) {
     chunk += csvRow(entries[index]!);
 
     if ((index + 1) % CSV_CHUNK_ROWS === 0) {
       if (!stream.write(chunk)) {
+        // Phase 2a -- socket backpressure. Timed separately because a stall
+        // here means the server is not draining what we send, which is a very
+        // different fault from a slow commit.
+        const drainStart = performance.now();
         await once(stream, "drain");
+        drainMs += performance.now() - drainStart;
       }
 
       chunk = "";
@@ -79,9 +124,24 @@ export async function insertLogs(entries: NewLog[]) {
     stream.write(chunk);
   }
 
+  const writtenAt = performance.now();
+
   stream.end();
 
+  // Phase 3 -- commit. postgres.js settles this only on CommandComplete, so
+  // this span is PostgreSQL executing and committing the COPY.
   await finished(stream);
+
+  const total = performance.now() - startedAt;
+
+  if (total >= SLOW_FLUSH_MS) {
+    console.warn(
+      `Slow COPY: ${Math.round(total)}ms for ${entries.length} rows ` +
+        `(acquire ${Math.round(acquiredAt - startedAt)}ms, ` +
+        `write ${Math.round(writtenAt - acquiredAt)}ms incl ${Math.round(drainMs)}ms drain, ` +
+        `commit ${Math.round(performance.now() - writtenAt)}ms)`,
+    );
+  }
 }
 
 /**
