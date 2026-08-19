@@ -308,7 +308,7 @@ test("POST /logs rejects malformed JSON as a client error", async () => {
   }
 });
 
-test("POST /logs rejects a body larger than the limit with 413", async () => {
+test("POST /logs rejects a body larger than the limit with 413", { timeout: 30_000 }, async () => {
   const { server, baseUrl } = await startServer();
 
   // Comfortably past the 16 MiB cap, and deliberately not valid JSON: the size
@@ -328,14 +328,25 @@ test("POST /logs rejects a body larger than the limit with 413", async () => {
         },
         (response) => {
           const parts: Buffer[] = [];
+          let done = false;
 
-          response.on("data", (part) => parts.push(Buffer.from(part)));
-          response.on("end", () =>
+         
+          const finish = () => {
+            if (done) {
+              return;
+            }
+
+            done = true;
+
             resolve({
               status: response.statusCode ?? 0,
               body: Buffer.concat(parts).toString("utf-8"),
-            }),
-          );
+            });
+          };
+
+          response.on("data", (part) => parts.push(Buffer.from(part)));
+          response.on("end", finish);
+          response.on("close", finish);
         },
       );
 
