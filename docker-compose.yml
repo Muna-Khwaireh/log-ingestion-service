@@ -85,11 +85,6 @@ services:
      
       - "-c"
       - "wal_compression=lz4"
-      # Commit-latency experiment: acknowledge on commit (rows are visible at
-      # once) rather than blocking on the WAL fsync. Read-after-write still
-      # holds; at most wal_writer_delay (200ms) of acked logs is lost on a crash.
-      - "-c"
-      - "synchronous_commit=off"
     environment:
       POSTGRES_DB: logs
       POSTGRES_USER: postgres
