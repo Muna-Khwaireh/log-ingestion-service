@@ -125,11 +125,68 @@ export async function insertLogs(entries: NewLog[]) {
   }
 }
 
+/**
+ * Every jsonb value that could satisfy `attributes ->> key = value`.
+ *
+ * Filter values always arrive as strings, but attributes store strings, numbers
+ * and booleans as their own jsonb types. `->>` renders whichever is stored as
+ * text before comparing, so a stored number 42 matches the string "42". These
+ * are the candidate jsonb forms that could render to `value`.
+ */
+function containmentCandidates(key: string, value: string) {
+  const candidates: Record<string, string | number | boolean>[] = [
+    { [key]: value },
+  ];
+
+  // Number rather than Number.parseFloat, which is too lax: it reads "42abc"
+  // as 42. Number rejects that outright. The empty-string guard is separate
+  // because Number("") is 0, which would otherwise add a candidate matching
+  // every row stored as zero.
+  //
+  // This only has to be close: a value that is not really a number costs an
+  // extra index probe that matches nothing, and one that over-matches (" 42 ",
+  // "0x10") is caught by the recheck below.
+  const asNumber = Number(value);
+
+  if (value.trim() !== "" && Number.isFinite(asNumber)) {
+    candidates.push({ [key]: asNumber });
+  }
+
+  if (value === "true" || value === "false") {
+    candidates.push({ [key]: value === "true" });
+  }
+
+  return candidates;
+}
+
+/**
+ * Attribute filters, as an index-searchable containment test plus an exact
+ * recheck.
+ *
+ * The obvious spelling, `attributes ? key AND attributes ->> key = value`, is
+ * correct but effectively unindexed: `?` tests only that the key is present, so
+ * on log data where every row carries the key it selects every row and the
+ * value comparison runs as a heap filter. Measured on 707k rows, the planner
+ * ignored the GIN index entirely and filtered out 707,512 rows to return 8.
+ *
+ * Containment keys on the key and the value together, so the index narrows to
+ * the matching rows. The candidate set is a superset of the true matches -- it
+ * cannot distinguish a stored 42 from a stored 42.0, both of which contain the
+ * number 42 -- so the original `->>` comparison is kept as a recheck and the
+ * result stays exactly what it was before. The same query then plans as a
+ * bitmap index scan returning 8 rows, at 0.7ms instead of 653ms.
+ *
+ * Containment requires the index to be built with `jsonb_path_ops`, which does
+ * not support `?`; the opclass in the schema and this predicate go together.
+ */
 function attributeConditions(filters: Record<string, string>) {
-  return Object.entries(filters).map(
-    ([key, value]) =>
-      sql`(${logs.attributes} ? ${key} AND ${logs.attributes} ->> ${key} = ${value})`,
-  );
+  return Object.entries(filters).map(([key, value]) => {
+    const candidates = containmentCandidates(key, value).map(
+      (candidate) => sql`${logs.attributes} @> ${JSON.stringify(candidate)}::jsonb`,
+    );
+
+    return sql`(${or(...candidates)} AND ${logs.attributes} ->> ${key} = ${value})`;
+  });
 }
 
 function containsPattern(messageQuery: string) {

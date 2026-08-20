@@ -1,0 +1,27 @@
+--
+-- Rebuild the attribute index with the jsonb_path_ops operator class.
+--
+-- The default jsonb_ops class indexes keys and values as separate entries, so
+-- the only operator it can serve for a filter is `?` (key exists). On log data
+-- every row from a service carries the same attribute keys, so `?` matches
+-- every row and the value comparison falls back to a heap filter: measured on
+-- 707k rows the planner declined to use the index at all and removed 707,512
+-- rows by filter to return 8.
+--
+-- jsonb_path_ops indexes hashed key/value paths, which lets the containment
+-- operator `@>` narrow on the key and the value together. The same query then
+-- plans as a bitmap index scan returning 8 rows.
+--
+-- It is also cheaper to maintain, which matters because the database is the
+-- write bottleneck: 1098 bytes of WAL per ingested row against 1400 for
+-- jsonb_ops, and 71MB of index per million rows against 112MB. Ingestion
+-- throughput on the machine this was measured on does not separate the two
+-- operator classes -- it is CPU-bound there, and the difference sits inside
+-- run-to-run variance -- so the saving is claimed as write volume only.
+--
+-- Dropped and recreated rather than altered because an operator class cannot be
+-- changed in place. On the parent table this cascades to every partition.
+--
+DROP INDEX IF EXISTS "idx_logs_attributes";
+--> statement-breakpoint
+CREATE INDEX "idx_logs_attributes" ON "logs" USING gin ("attributes" jsonb_path_ops);

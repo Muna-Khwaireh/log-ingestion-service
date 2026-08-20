@@ -185,6 +185,10 @@ test("GET /logs compares attribute values as strings across JSON types", async (
               retries: 3,
               successful: true,
               user_id: "42",
+              // Stored with a fractional part so the pair below pins down how
+              // numeric formatting is compared: 3 and 3.0 are the same jsonb
+              // number but render differently through ->>.
+              ratio: 2.5,
             },
           },
         ],
@@ -211,11 +215,26 @@ test("GET /logs compares attribute values as strings across JSON types", async (
     assert.equal(await matchCount("attr.successful=true"), 1);
     assert.equal(await matchCount("attr.user_id=42"), 1);
 
+    assert.equal(await matchCount("attr.ratio=2.5"), 1);
+
     // Values that genuinely differ must still not match.
     assert.equal(await matchCount("attr.retries=4"), 0);
     assert.equal(await matchCount("attr.successful=false"), 0);
     assert.equal(await matchCount("attr.user_id=43"), 0);
     assert.equal(await matchCount("attr.absent=3"), 0);
+
+    // Comparison is on the rendered text, not on numeric equality. "3.0" and
+    // "3" are the same jsonb number, so a containment test alone would match
+    // both of these; ->> renders the stored 3 as "3", so neither may match.
+    // These are the cases the recheck alongside the containment test exists
+    // for.
+    assert.equal(await matchCount("attr.retries=3.0"), 0);
+    assert.equal(await matchCount("attr.ratio=2.50"), 0);
+
+    // A filter value that is not a number at all must not break the numeric
+    // candidate, and an empty one must not be read as 0.
+    assert.equal(await matchCount("attr.retries=3abc"), 0);
+    assert.equal(await matchCount("attr.retries="), 0);
   } finally {
     await stopServer(server);
   }

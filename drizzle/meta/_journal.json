@@ -36,6 +36,13 @@
       "when": 1787083654060,
       "tag": "0004_partition_logs_by_time",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1787097600000,
+      "tag": "0005_attributes_path_ops",
+      "breakpoints": true
     }
   ]
 }

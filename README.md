@@ -422,20 +422,46 @@ Supports queries filtering by service while maintaining efficient timestamp orde
 idx_logs_attributes
 ```
 
-A GIN index is used for JSONB attribute queries.
+A GIN index with the `jsonb_path_ops` operator class is used for JSONB
+attribute queries.
 
 Attribute values are compared as strings, so a stored number or boolean matches
-the string form supplied in the query:
+the string form supplied in the query. That comparison is spelled as a
+containment test over every jsonb form the filter value could have been stored
+as, followed by the string comparison as an exact recheck:
+
+```sql
+(attributes @> '{"user_id":"42"}' OR attributes @> '{"user_id":42}')
+AND attributes ->> 'user_id' = '42'
+```
+
+Containment alone would be wrong, because it is type-strict in one direction
+and too loose in the other: a stored `"retries": 3` does not contain the string
+`"3"`, and a stored `3.0` does contain the number `3` even though `->>` renders
+it as `"3.0"`. Enumerating the candidate forms covers the first case, and
+keeping `->>` as a recheck covers the second, so the result set is exactly what
+a plain `->>` comparison would return.
+
+The earlier spelling used the key-existence operator instead:
 
 ```sql
 attributes ? 'user_id' AND attributes ->> 'user_id' = '42'
 ```
 
-Containment (`@>`) is not used, because it is type-strict: a stored
-`"retries": 3` would never match the string `"3"` arriving from the query
-string. The key existence check is GIN-indexable, so a selective attribute key
-still narrows the scan through `idx_logs_attributes` before the text
-comparison runs.
+That is correct but effectively unindexed. `?` tests only that the key is
+present, and log rows from one service carry the same attribute keys, so it
+matches nearly every row. Measured over 707,520 rows where `user_id` was
+present on all of them and `user_id = '42'` matched 8, the planner declined to
+use `idx_logs_attributes` at all, scanned the primary key backward for the sort
+order and removed 707,512 rows by filter.
+
+| predicate | index used | rows from index | query time |
+| --- | --- | --- | --- |
+| `? key AND ->> key = value` | none (pkey scan + filter) | — | 653 ms |
+| `@> candidates AND ->> key = value` | `idx_logs_attributes` | 8 | 0.7 ms |
+
+`jsonb_path_ops` cannot serve `?`, so the operator class and the predicate go
+together. Nothing queries for key existence on its own.
 
 ### Index Budget
 
@@ -465,6 +491,53 @@ Both measurements above predate `0004_partition_logs_by_time`, which replaced
 the standalone `idx_logs_timestamp_id` with the `(timestamp, id)` primary key.
 `logs_pkey` serves the same access path, so the conclusions still hold — the
 index named in those measurements is simply called `logs_pkey` today.
+
+### Attribute index cost
+
+Of the indexes that remain, `idx_logs_attributes` is by a wide margin the most
+expensive to maintain, because a GIN index emits one entry per attribute rather
+than one per row. Measured over paired 60-second runs at 33 logs per request
+against the container limits below, with attributes carrying eight keys of
+mixed cardinality. Each arm was run twice, alternating on one warm cluster, and
+both figures are given because the spread matters when reading them:
+
+| attribute index | logs/second | ingest p95 | WAL per row | index per million rows | database CPU |
+| --- | --- | --- | --- | --- | --- |
+| `gin (attributes)` — jsonb_ops | 13,830 / 13,557 | 1.14 / 1.02 s | 1400 B | 112 MB | 89% |
+| `gin (attributes jsonb_path_ops)` | 13,306 / 15,367 | 1.38 / 1.09 s | 1098 B | 71 MB | 82% |
+| no attribute index | 16,753 / 16,566 | 640 / 620 ms | 538 B | — | 83% |
+
+Write volume is the number to read here, not throughput. WAL per row is stable
+to within 3 bytes across repeats, while throughput on this hardware varies by
+up to 2,000 logs/second between identical runs — the difference in throughput
+between the two operator classes sits inside that spread and should not be
+claimed as a win. The database here is CPU-bound at 82-89%, so it is not the
+environment where saving bytes of WAL pays; a database bound on write I/O is.
+
+On that stable measure the index is the dominant cost in the write path. Even
+as `jsonb_path_ops` it more than doubles WAL, from 538 bytes per row to 1098.
+Dropping it is the only change measured here that moves throughput
+unambiguously, by 22%.
+
+It is kept because attribute filtering is part of the API. `jsonb_path_ops` is
+what makes keeping it defensible: 22% less WAL and 37% less index than the
+default operator class, and, unlike the default, an index the planner actually
+uses — the same filter goes from a 653 ms scan to a sub-millisecond index
+lookup. Under the default operator class the index was pure write cost for no
+read benefit at all.
+
+Attribute content dominates ingestion cost regardless of the index. The same
+harness with the attribute object varied and everything else held constant:
+
+| attributes per row | logs/second |
+| --- | --- |
+| none | 22,167 |
+| 3 keys, low cardinality | 20,136 |
+| 8 keys, mixed cardinality | 13,055 |
+
+`fastupdate` is left at its default of `on`. Turning it off was measured at
+8,264 logs/second — 39% slower — because every insert then pays full index
+maintenance instead of appending to the pending list.
 
 ## Query Performance
 
