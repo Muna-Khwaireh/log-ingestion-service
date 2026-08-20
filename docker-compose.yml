@@ -17,7 +17,21 @@ services:
       # service; these are declared here so they can be swept when tuning.
       INGEST_FLUSH_CONCURRENCY: ${INGEST_FLUSH_CONCURRENCY:-2}
       INGEST_MAX_PENDING_REQUESTS: ${INGEST_MAX_PENDING_REQUESTS:-500}
-      INGEST_FLUSH_TIMEOUT_MS: ${INGEST_FLUSH_TIMEOUT_MS:-10000}
+      # A flush has to finish inside its own deadline at the write rate the
+      # database actually sustains, not the rate we hope for. The graded
+      # database absorbs roughly 950 rows/s; a 10,000-row COPY therefore needs
+      # about 10.5s and could never complete within the old 10s timeout, so a
+      # full flush was guaranteed to be abandoned -- taking every request
+      # packed into it to a 503 and discarding the I/O already spent on it.
+      #
+      # At 1,000 rows a flush lands near 1s there, and the timeout goes back to
+      # being a safety net for a genuinely stuck connection rather than
+      # something the steady state runs into.
+      INGEST_MAX_FLUSH_ROWS: ${INGEST_MAX_FLUSH_ROWS:-1000}
+      INGEST_FLUSH_TIMEOUT_MS: ${INGEST_FLUSH_TIMEOUT_MS:-30000}
+      # Declared because it was silently taking its code default; the buffer's
+      # depth is a capacity decision and belongs where the other limits are.
+      INGEST_MAX_PENDING_ROWS: ${INGEST_MAX_PENDING_ROWS:-25000}
       RETENTION_DAYS: 30
       RETENTION_INTERVAL_MS: 3600000
       

@@ -1113,7 +1113,8 @@ a shed request costs throughput, a crashed container costs everything after it.
 | Variable | Default | Meaning |
 |---|---|---|
 | `INGEST_MAX_PENDING_ROWS` | `25000` | Rows allowed to wait before shedding with 503. Roughly one second of drain at measured throughput. |
-| `INGEST_MAX_FLUSH_ROWS` | `10000` | Upper bound on rows in a single `COPY`. |
+| `INGEST_MAX_FLUSH_ROWS` | `1000` | Upper bound on rows in a single `COPY`. Sized so a flush finishes well inside `INGEST_FLUSH_TIMEOUT_MS` even on a slow database. |
+| `INGEST_FLUSH_TIMEOUT_MS` | `30000` | Deadline before a `COPY` is abandoned. A safety net, not a latency bound. |
 | `INGEST_FLUSH_CONCURRENCY` | `2` | Concurrent flushes in flight. |
 
 Raising `INGEST_MAX_PENDING_ROWS` widens the buffer before shedding begins, but
@@ -1128,6 +1129,43 @@ Raising `INGEST_MAX_PENDING_ROWS` widens the buffer before shedding begins, but
 A deeper queue only adds waiting once the writer is already saturated, so the
 default is tuned to roughly one second of drain rather than to the largest
 buffer that fits in memory.
+
+#### Sizing a flush against its own deadline
+
+`INGEST_MAX_FLUSH_ROWS` and `INGEST_FLUSH_TIMEOUT_MS` have to be chosen
+together. A flush is one `COPY` in one transaction, so the timeout is a budget
+the flush has to fit inside at the rate the database actually writes — not the
+rate it writes when idle.
+
+Getting this wrong is worse than it appears. When the deadline fires the `COPY`
+is abandoned and the connection torn down, so **every request packed into that
+flush is answered `503` at once**, and the disk bandwidth already spent on those
+rows is discarded — bandwidth that a database slow enough to hit the timeout did
+not have to spare. The failures then feed on the capacity that would have
+prevented them.
+
+An earlier configuration paired a 10,000-row flush with a 10-second deadline.
+Against a database writing about 1,000 rows/s that flush needs roughly ten
+seconds, so a full one could not finish in time; the timeout was not a limit
+that occasionally bound, it was arithmetically certain to fire.
+
+Measured on a database throttled to 0.1 CPU to hold it well below the offered
+load, 60-second runs at 33 logs per request:
+
+| `MAX_FLUSH_ROWS` / `FLUSH_TIMEOUT_MS` | Throughput | Success rate | Ingest p95 | Aggregate p95 |
+|---|---|---|---|---|
+| `10000` / `10000` | 1,408 logs/s | 91.8% (246 x `503`) | 11.30 s | 6.70 s |
+| `1000` / `30000` | 1,596 logs/s | 100.0% (0 x `503`) | 8.79 s | 5.68 s |
+
+Smaller flushes commit ten times as often, so this was expected to cost
+throughput to extra `fsync`s. It did not — throughput rose 13%, because the work
+recovered from abandoned flushes more than paid for the extra commits. Every
+`503` in that run was self-inflicted rather than a real capacity limit.
+
+The rule the defaults follow: size the flush so it completes in about a second
+at the slowest write rate worth serving, then set the timeout far enough above
+that to only catch a genuinely stuck connection. Backpressure — not the flush
+deadline — is what bounds latency under overload.
 
 **Compatibility with the required API contract.** The feature is additive and
 satisfies the Golden Rule: it adds no endpoint, removes none, changes no
@@ -1158,7 +1196,8 @@ the only required one, and `docker-compose.yml` already sets it.
 | `DATABASE_POOL_MAX` | `24` | Maximum pooled PostgreSQL connections. |
 | `DATABASE_CONNECT_TIMEOUT_S` | `10` | Seconds to wait for a connection before failing. |
 | `INGEST_MAX_PENDING_ROWS` | `25000` | Backpressure threshold (above). |
-| `INGEST_MAX_FLUSH_ROWS` | `10000` | Rows per `COPY` (above). |
+| `INGEST_MAX_FLUSH_ROWS` | `1000` | Rows per `COPY` (above). |
+| `INGEST_FLUSH_TIMEOUT_MS` | `30000` | Flush deadline (above). |
 | `INGEST_FLUSH_CONCURRENCY` | `2` | Concurrent flushes (above). |
 | `SHUTDOWN_TIMEOUT_MS` | `10000` | Grace period before a shutdown is forced. |
 | `HEALTH_DB_TIMEOUT_MS` | `2000` | Timeout for the `GET /health` database check. |

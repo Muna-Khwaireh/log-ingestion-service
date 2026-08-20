@@ -38,9 +38,18 @@ function csvRow(entry: NewLog) {
   );
 }
 
+/**
+ * How long a single COPY may run before it is abandoned.
+ *
+ * Deliberately generous relative to INGEST_MAX_FLUSH_ROWS. This exists to
+ * recover from a connection that is genuinely stuck, not to bound normal
+ * latency -- backpressure does that. A timeout tight enough to fire in the
+ * steady state converts a slow database into a failing one, because every
+ * request in the abandoned flush is answered 503.
+ */
 const FLUSH_TIMEOUT_MS = (() => {
   const value = Number(process.env.INGEST_FLUSH_TIMEOUT_MS);
-  return Number.isInteger(value) && value > 0 ? value : 10_000;
+  return Number.isInteger(value) && value > 0 ? value : 30_000;
 })();
 
 /** Raised when a COPY exceeds FLUSH_TIMEOUT_MS and is abandoned. */

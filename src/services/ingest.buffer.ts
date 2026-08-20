@@ -8,8 +8,18 @@ function positiveIntFromEnv(name: string, fallback: number) {
   return Number.isInteger(value) && value > 0 ? value : fallback;
 }
 
-/** Upper bound on rows in a single COPY, so one flush cannot grow unbounded. */
-const MAX_FLUSH_ROWS = positiveIntFromEnv("INGEST_MAX_FLUSH_ROWS", 10_000);
+/**
+ * Upper bound on rows in a single COPY.
+ *
+ * This is a deadline budget, not just a memory bound: a flush has to finish
+ * inside INGEST_FLUSH_TIMEOUT_MS at the write rate the database actually
+ * sustains. Sized for a slow database -- at ~1,000 rows/s a flush this size
+ * completes in about a second, leaving the timeout as a safety net rather than
+ * something the steady state collides with. Oversizing it is worse than it
+ * looks, because an abandoned flush rejects every request packed into it and
+ * throws away the I/O it already spent.
+ */
+const MAX_FLUSH_ROWS = positiveIntFromEnv("INGEST_MAX_FLUSH_ROWS", 1_000);
 
 
 const MAX_PENDING_ROWS = positiveIntFromEnv("INGEST_MAX_PENDING_ROWS", 25_000);
